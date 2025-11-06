@@ -617,8 +617,8 @@ class MiDashengLMModel(nn.Module):
 
         masked_audio_features = audio_embeddings[audio_feature_mask].view(-1, embed_dim)
 
-        # Split into individual audio embeddings
-        return torch.split(masked_audio_features, audio_output_lengths)
+        # Return concatenated audio embeddings (all valid audio tokens in sequence)
+        return masked_audio_features
 
     def get_input_embeddings(self):
         return self.language_model.model.embed_tokens
