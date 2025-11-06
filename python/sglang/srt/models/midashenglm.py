@@ -629,7 +629,7 @@ class MiDashengLMModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        get_embedding: bool = False,
+        **kwargs,
     ):
         """Run forward pass for MiDashengLM.
 
@@ -637,23 +637,14 @@ class MiDashengLMModel(nn.Module):
             input_ids: Flattened (concatenated) input_ids corresponding to a batch.
             positions: Flattened (concatenated) position ids corresponding to a batch.
             forward_batch: Forward batch information including multimodal data.
-            get_embedding: If True, return embeddings instead of logits.
         """
-        # Process multimodal inputs and get hidden states
-        hidden_states = general_mm_embed_routine(
+        # Process multimodal inputs through language model (matches Qwen2Audio pattern)
+        return general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
-            language_model=self.language_model.model,
-            multimodal_model=self,
+            language_model=self.language_model,
             positions=positions,
             data_embedding_funcs={Modality.AUDIO: self.get_audio_feature},
-        )
-
-        if get_embedding:
-            return hidden_states
-
-        return self.logits_processor(
-            input_ids, hidden_states, self.language_model.lm_head, forward_batch
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
