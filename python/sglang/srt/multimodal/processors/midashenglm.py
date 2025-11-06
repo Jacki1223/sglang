@@ -56,6 +56,10 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
         Returns:
             Dictionary containing processed multimodal data
         """
+        # Automatically prepend audio token if not present
+        if audio_data and not self.AUDIO_TOKEN_REGEX.search(input_text):
+            input_text = f"{self.AUDIO_TOKEN}{input_text}"
+
         base_output = self.load_mm_data(
             prompt=input_text,
             audio_data=audio_data,
