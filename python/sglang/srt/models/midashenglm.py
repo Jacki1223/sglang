@@ -577,8 +577,17 @@ class MiDashengLMModel(nn.Module):
         Returns:
             audio_embeddings: Concatenated audio embeddings
         """
+        import logging
+        logger = logging.getLogger(__name__)
+
         # Concatenate all audio waveforms
+        logger.info(f"[MiDashengLM DEBUG] Number of audio items: {len(items)}")
+        for i, item in enumerate(items):
+            logger.info(f"[MiDashengLM DEBUG] Item {i} feature shape: {item.feature.shape}, dtype: {item.feature.dtype}")
+            logger.info(f"[MiDashengLM DEBUG] Item {i} audio_length: {getattr(item, 'audio_length', 'NOT SET')}")
+
         input_values = torch.cat([item.feature for item in items], dim=0)
+        logger.info(f"[MiDashengLM DEBUG] Concatenated input_values shape: {input_values.shape}, dtype: {input_values.dtype}")
 
         # Get audio lengths if available
         audio_lengths = []
@@ -590,11 +599,17 @@ class MiDashengLMModel(nn.Module):
                 audio_lengths.append(item.feature.shape[-1])
 
         audio_length = torch.tensor(audio_lengths, device=input_values.device)
+        logger.info(f"[MiDashengLM DEBUG] audio_length tensor: {audio_length}")
 
         # Process through encoder and projector
         encoder_out, encoder_atts = self.audio_encoder(input_values, audio_length)
+        logger.info(f"[MiDashengLM DEBUG] encoder_out shape: {encoder_out.shape}, encoder_atts shape: {encoder_atts.shape}")
+
         audio_embeddings, _ = self.audio_projector(encoder_out, encoder_atts)
+        logger.info(f"[MiDashengLM DEBUG] audio_embeddings shape after projector: {audio_embeddings.shape}")
+
         audio_embeddings = audio_embeddings.to(input_values.dtype)
+        logger.info(f"[MiDashengLM DEBUG] audio_embeddings dtype after conversion: {audio_embeddings.dtype}")
 
         batch_size, max_audio_tokens, embed_dim = audio_embeddings.shape
 
@@ -607,6 +622,7 @@ class MiDashengLMModel(nn.Module):
             audio_output_lengths,
             device=audio_embeddings.device,
         )
+        logger.info(f"[MiDashengLM DEBUG] audio_output_lengths: {audio_output_lengths}")
 
         # Create mask and extract valid features
         audio_feature_mask = torch.arange(
@@ -614,8 +630,11 @@ class MiDashengLMModel(nn.Module):
         ).unsqueeze(0).expand(
             batch_size, max_audio_tokens
         ) < audio_output_lengths_tensor.unsqueeze(1)
+        logger.info(f"[MiDashengLM DEBUG] audio_feature_mask sum: {audio_feature_mask.sum().item()} out of {audio_feature_mask.numel()}")
 
         masked_audio_features = audio_embeddings[audio_feature_mask].view(-1, embed_dim)
+        logger.info(f"[MiDashengLM DEBUG] Final masked_audio_features shape: {masked_audio_features.shape}")
+        logger.info(f"[MiDashengLM DEBUG] masked_audio_features stats: min={masked_audio_features.min().item():.4f}, max={masked_audio_features.max().item():.4f}, mean={masked_audio_features.mean().item():.4f}")
 
         # Return concatenated audio embeddings (all valid audio tokens in sequence)
         return masked_audio_features
