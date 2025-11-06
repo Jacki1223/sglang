@@ -40,6 +40,10 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             "audio_length": Modality.AUDIO,
         })
 
+        # Add input_values to FEATURE_NAMES so it's recognized as a feature tensor
+        if "input_values" not in self.FEATURE_NAMES:
+            self.FEATURE_NAMES.append("input_values")
+
     def process_mm_data(self, input_text, images=None, videos=None, audios=None, **kwargs):
         """Override to use correct audio parameter name for MiDashengLM processor."""
         if images:
@@ -60,8 +64,8 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             **kwargs,
         )
 
-        if not self.server_args.keep_mm_feature_on_device:
-            # Move feature tensors to CPU if needed
+        # Move feature tensors to CPU if needed (backward compatible check)
+        if not getattr(self.server_args, 'keep_mm_feature_on_device', False):
             for feature_name in ["input_values"]:
                 if feature_name in result:
                     result[feature_name] = result[feature_name].cpu()
