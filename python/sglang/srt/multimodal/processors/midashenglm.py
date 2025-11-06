@@ -1,7 +1,7 @@
 import re
 
 from sglang.srt.managers.schedule_batch import Modality
-from sglang.srt.models.midashenglm import MiDashengLMForConditionalGeneration
+from sglang.srt.models.midashenglm import MiDashengLMModel
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -11,7 +11,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
     """Multimodal processor for MiDashengLM audio-language model."""
 
-    models = [MiDashengLMForConditionalGeneration]
+    models = [MiDashengLMModel]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)

@@ -497,7 +497,7 @@ class AudioProjectorSubsample(nn.Module):
         return x, mask
 
 
-class MiDashengLMForConditionalGeneration(nn.Module):
+class MiDashengLMModel(nn.Module):
     """MiDashengLM model for audio-language processing."""
 
     # BitandBytes specific attributes
@@ -651,11 +651,11 @@ class MiDashengLMForConditionalGeneration(nn.Module):
         """Load model weights."""
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            ("gate_up_proj", "up_proj", 1),
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
         ]
 
         params_dict = dict(self.named_parameters(remove_duplicate=False))
@@ -663,25 +663,30 @@ class MiDashengLMForConditionalGeneration(nn.Module):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
+                continue
 
-            # Handle stacked parameters
+            # Handle stacked parameters (skip audio_encoder)
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
+                if weight_name not in name or "audio_encoder" in name or "audio_projector" in name:
                     continue
-                name = name.replace(weight_name, param_name)
+                name_tmp = name.replace(weight_name, param_name)
 
                 # Skip loading extra bias for quantized models
-                if name.endswith(".bias") and name not in params_dict:
+                if name_tmp.endswith(".bias") and name_tmp not in params_dict:
                     continue
 
-                param = params_dict[name]
+                if name_tmp not in params_dict:
+                    continue
+
+                param = params_dict[name_tmp]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # Handle audio encoder attention weights
                 if "audio_encoder" in name and ".attn.qkv." in name:
-                    name = name.replace(".attn.qkv.", ".attn.qkv_proj.")
+                    name = name.replace(".attn.qkv.", ".attn.attn.qkv_proj.")
 
                 # Skip loading extra bias for quantized models
                 if name.endswith(".bias") and name not in params_dict:
@@ -699,4 +704,4 @@ class MiDashengLMForConditionalGeneration(nn.Module):
 
 
 # Register the model
-EntryClass = [MiDashengLMForConditionalGeneration]
+EntryClass = [MiDashengLMModel]
