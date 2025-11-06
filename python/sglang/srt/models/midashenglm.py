@@ -35,16 +35,13 @@ import torch.nn as nn
 import torchaudio.functional as F
 from transformers import PretrainedConfig
 
-from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -52,7 +49,7 @@ from sglang.srt.managers.mm_utils import (
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen2 import Qwen2Model
+from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.utils import add_prefix
 
 _Tuple2: TypeAlias = int | tuple[int, int] | Sequence[int]
@@ -548,24 +545,13 @@ class MiDashengLMForConditionalGeneration(nn.Module):
         )
 
         # Initialize language model (decoder)
-        self.model = Qwen2Model(
+        self.language_model = Qwen2ForCausalLM(
             config.text_config,
             quant_config=quant_config,
-            prefix=add_prefix("decoder.model", prefix),
+            prefix=add_prefix("decoder", prefix),
         )
 
-        # LM head
-        if config.text_config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
-        else:
-            self.lm_head = ParallelLMHead(
-                config.text_config.vocab_size,
-                config.text_config.hidden_size,
-                quant_config=quant_config,
-                prefix=add_prefix("decoder.lm_head", prefix),
-            )
-
-        self.logits_processor = LogitsProcessor(config.text_config)
+        self.logits_processor = self.language_model.logits_processor
         self.quant_config = quant_config
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
@@ -626,7 +612,7 @@ class MiDashengLMForConditionalGeneration(nn.Module):
         return torch.split(masked_audio_features, audio_output_lengths)
 
     def get_input_embeddings(self):
-        return self.model.embed_tokens
+        return self.language_model.model.embed_tokens
 
     @torch.no_grad()
     def forward(
@@ -648,7 +634,7 @@ class MiDashengLMForConditionalGeneration(nn.Module):
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
-            language_model=self.model,
+            language_model=self.language_model.model,
             multimodal_model=self,
             positions=positions,
             data_embedding_funcs={Modality.AUDIO: self.get_audio_feature},
@@ -658,7 +644,7 @@ class MiDashengLMForConditionalGeneration(nn.Module):
             return hidden_states
 
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids, hidden_states, self.language_model.lm_head, forward_batch
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -709,7 +695,7 @@ class MiDashengLMForConditionalGeneration(nn.Module):
                 weight_loader(param, loaded_weight)
 
     def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
+        return self.language_model.model.embed_tokens.weight, self.language_model.lm_head.weight
 
 
 # Register the model
