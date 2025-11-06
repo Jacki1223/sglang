@@ -40,6 +40,34 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             "audio_length": Modality.AUDIO,
         })
 
+    def process_mm_data(self, input_text, images=None, videos=None, audios=None, **kwargs):
+        """Override to use correct audio parameter name for MiDashengLM processor."""
+        if images:
+            kwargs["images"] = images
+        if videos:
+            kwargs["videos"] = videos
+        if audios:
+            # MiDashengLM processor uses 'audio' (singular) like Qwen2Audio
+            kwargs["audio"] = audios
+            kwargs["audio_kwargs"] = {}
+            kwargs["audio_kwargs"].setdefault("truncation", False)
+
+        processor = self._processor
+        result = processor.__call__(
+            text=[input_text],
+            padding=True,
+            return_tensors="pt",
+            **kwargs,
+        )
+
+        if not self.server_args.keep_mm_feature_on_device:
+            # Move feature tensors to CPU if needed
+            for feature_name in ["input_values"]:
+                if feature_name in result:
+                    result[feature_name] = result[feature_name].cpu()
+
+        return result
+
     async def process_mm_data_async(
         self,
         audio_data,
