@@ -34,7 +34,11 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             audio_token_id=self.audio_token_id,
         ).build(_processor)
 
-        self.ATTR_NAME_TO_MODALITY.update({"audio_length": Modality.AUDIO})
+        # Register audio-related attributes
+        self.ATTR_NAME_TO_MODALITY.update({
+            "input_values": Modality.AUDIO,
+            "audio_length": Modality.AUDIO,
+        })
 
     async def process_mm_data_async(
         self,
@@ -64,15 +68,14 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             base_output, self.mm_tokens
         )
 
-        # MiDashengLM uses audio_length to track audio duration
-        assert (
-            "audio_length" in ret
-        ), "audio_length not found in processor output"
-
-        # Store audio length information
-        audio_lengths = ret["audio_length"]
-        if len(mm_items) > 0:
-            mm_items[0].audio_length = audio_lengths[0] if len(audio_lengths) > 0 else None
+        # MiDashengLM processor returns input_values (audio waveforms)
+        # We need to extract audio_length from the input_values shape
+        if "input_values" in ret and len(mm_items) > 0:
+            # input_values shape is [batch_size, audio_length]
+            input_values = ret["input_values"]
+            # For MiDashengLM, audio_length is the actual waveform length
+            audio_length = input_values.shape[-1] if input_values.ndim >= 2 else input_values.shape[0]
+            mm_items[0].audio_length = audio_length
 
         return {
             "mm_items": mm_items,
