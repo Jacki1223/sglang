@@ -130,15 +130,23 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
                 sys.stderr.write(f"[PROCESSOR DEBUG] mm_item[{i}] feature shape: {item.feature.shape}\n")
         sys.stderr.flush()
 
-        # MiDashengLM processor returns input_values (audio waveforms)
-        # We need to extract audio_length from the input_values shape
-        if "input_values" in ret and len(mm_items) > 0:
-            # input_values shape is [batch_size, audio_length]
+        # MiDashengLM processor returns audio_length from feature_extractor
+        # This is the mel-spectrogram frame count, NOT the waveform length
+        if "audio_length" in ret and len(mm_items) > 0:
+            # Use the audio_length calculated by HuggingFace processor
+            # This is based on attention_mask.sum(-1) which gives the correct mel frame count
+            audio_length = ret["audio_length"]
+            if isinstance(audio_length, torch.Tensor):
+                audio_length = audio_length.item() if audio_length.numel() == 1 else audio_length[0].item()
+            mm_items[0].audio_length = audio_length
+            sys.stderr.write(f"[PROCESSOR DEBUG] Set audio_length={audio_length} (from processor, mel frame count)\n")
+            sys.stderr.flush()
+        elif "input_values" in ret and len(mm_items) > 0:
+            # Fallback: use waveform length if audio_length not provided
             input_values = ret["input_values"]
-            # For MiDashengLM, audio_length is the actual waveform length
             audio_length = input_values.shape[-1] if input_values.ndim >= 2 else input_values.shape[0]
             mm_items[0].audio_length = audio_length
-            sys.stderr.write(f"[PROCESSOR DEBUG] Set audio_length={audio_length}\n")
+            sys.stderr.write(f"[PROCESSOR DEBUG] Set audio_length={audio_length} (fallback, waveform length)\n")
             sys.stderr.flush()
 
         result = {
