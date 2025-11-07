@@ -731,10 +731,16 @@ class MiDashengLMModel(nn.Module):
                 audio_projector_loaded.append(original_name)
 
         # Pass decoder weights to language_model.load_weights()
+        # Strip "decoder." prefix since language_model expects weights without it
         if decoder_weights:
             sys.stderr.write(f"\n[WEIGHT LOADING] Passing {len(decoder_weights)} decoder weights to language_model.load_weights()\n")
             sys.stderr.flush()
-            self.language_model.load_weights(decoder_weights)
+            # Remove "decoder." prefix from weight names
+            decoder_weights_stripped = [
+                (name.replace("decoder.", "", 1), weight)
+                for name, weight in decoder_weights
+            ]
+            self.language_model.load_weights(decoder_weights_stripped)
 
         # Print summary
         sys.stderr.write(f"\n{'='*80}\n")
