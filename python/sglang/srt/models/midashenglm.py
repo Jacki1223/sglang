@@ -685,11 +685,22 @@ class MiDashengLMModel(nn.Module):
 
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
+        # Debug: print audio_projector params in model
+        projector_params = [k for k in params_dict.keys() if 'audio_projector' in k]
+        sys.stderr.write(f"\n[DEBUG] Model has {len(projector_params)} audio_projector params:\n")
+        for p in projector_params:
+            sys.stderr.write(f"  {p}\n")
+        sys.stderr.flush()
+
         audio_encoder_loaded = []
         audio_projector_loaded = []
         skipped_weights = []
+        projector_weight_names = []
 
         for name, loaded_weight in weights:
+            # Track all audio_projector weights from checkpoint
+            if "audio_projector" in name:
+                projector_weight_names.append(name)
             if "rotary_emb.inv_freq" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
@@ -724,7 +735,11 @@ class MiDashengLMModel(nn.Module):
                     continue
 
                 if name not in params_dict:
-                    skipped_weights.append(f"{original_name} (not in params)")
+                    if "audio_projector" in original_name:
+                        # More detailed error for projector weights
+                        skipped_weights.append(f"{original_name} -> {name} (NOT IN MODEL PARAMS)")
+                    else:
+                        skipped_weights.append(f"{original_name} (not in params)")
                     continue
 
                 param = params_dict[name]
@@ -739,11 +754,22 @@ class MiDashengLMModel(nn.Module):
 
         # Print summary
         sys.stderr.write(f"\n{'='*80}\n")
+        sys.stderr.write(f"[WEIGHT LOADING] Audio projector weights in checkpoint: {len(projector_weight_names)}\n")
+        if projector_weight_names:
+            sys.stderr.write(f"[WEIGHT LOADING] Projector weight names: {projector_weight_names}\n")
         sys.stderr.write(f"[WEIGHT LOADING] Audio encoder weights loaded: {len(audio_encoder_loaded)}\n")
         sys.stderr.write(f"[WEIGHT LOADING] Audio projector weights loaded: {len(audio_projector_loaded)}\n")
         sys.stderr.write(f"[WEIGHT LOADING] Skipped weights: {len(skipped_weights)}\n")
-        if skipped_weights:
-            sys.stderr.write(f"[WEIGHT LOADING] First 10 skipped: {skipped_weights[:10]}\n")
+
+        # Show specifically skipped projector weights
+        projector_skipped = [s for s in skipped_weights if 'audio_projector' in s]
+        if projector_skipped:
+            sys.stderr.write(f"[WEIGHT LOADING] Skipped audio_projector weights:\n")
+            for s in projector_skipped:
+                sys.stderr.write(f"  {s}\n")
+        else:
+            if skipped_weights:
+                sys.stderr.write(f"[WEIGHT LOADING] First 10 skipped: {skipped_weights[:10]}\n")
         sys.stderr.write(f"{'='*80}\n\n")
         sys.stderr.flush()
 
