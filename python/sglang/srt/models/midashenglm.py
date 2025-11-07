@@ -584,6 +584,8 @@ class MiDashengLMModel(nn.Module):
         for i, item in enumerate(items):
             sys.stderr.write(f"[MODEL DEBUG] Item {i} feature shape: {item.feature.shape}\n")
             sys.stderr.write(f"[MODEL DEBUG] Item {i} audio_length: {getattr(item, 'audio_length', 'NOT SET')}\n")
+            sys.stderr.write(f"[MODEL DEBUG] Item {i} pad_value: {getattr(item, 'pad_value', 'NOT SET')}\n")
+            sys.stderr.write(f"[MODEL DEBUG] Item {i} hash: {getattr(item, 'hash', 'NOT SET')}\n")
         sys.stderr.flush()
 
         input_values = torch.cat([item.feature for item in items], dim=0)
