@@ -637,6 +637,8 @@ class MiDashengLMModel(nn.Module):
         masked_audio_features = audio_embeddings[audio_feature_mask].view(-1, embed_dim)
         sys.stderr.write(f"[MODEL DEBUG] Final output shape: {masked_audio_features.shape}\n")
         sys.stderr.write(f"[MODEL DEBUG] Stats: min={masked_audio_features.min().item():.4f}, max={masked_audio_features.max().item():.4f}\n")
+        sys.stderr.write(f"[MODEL DEBUG] Audio embeddings dtype: {masked_audio_features.dtype}, device: {masked_audio_features.device}\n")
+        sys.stderr.write(f"[MODEL DEBUG] First 5 values of first audio token: {masked_audio_features[0, :5].tolist()}\n")
         sys.stderr.write("="*80 + "\n\n")
         sys.stderr.flush()
 
