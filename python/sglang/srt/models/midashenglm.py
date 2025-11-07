@@ -689,10 +689,18 @@ class MiDashengLMModel(nn.Module):
         # Also include buffers (for mel_scale, spectrogram window, etc.)
         buffers_dict = dict(self.named_buffers())
 
+        # Debug: print all buffer names in the model
+        sys.stderr.write("\n[DEBUG] All buffers in audio_encoder:\n")
+        for buf_name in buffers_dict.keys():
+            if "audio_encoder" in buf_name:
+                sys.stderr.write(f"  {buf_name}\n")
+        sys.stderr.flush()
+
         audio_encoder_loaded = []
         audio_projector_loaded = []
         skipped_weights = []
         decoder_weights = []  # Collect decoder weights to pass to language_model
+        buffer_loaded = []  # Track loaded buffers
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -740,8 +748,17 @@ class MiDashengLMModel(nn.Module):
                 weight_loader(param, loaded_weight)
             elif name in buffers_dict:
                 # Load as buffer (e.g., mel_scale, spectrogram window, BatchNorm stats)
+                sys.stderr.write(f"[DEBUG] Loading buffer: {original_name} -> {name}\n")
+                sys.stderr.flush()
                 buffers_dict[name].copy_(loaded_weight)
+                buffer_loaded.append(original_name)
             else:
+                # Debug: check if this might be a buffer that needs mapping
+                if "audio_encoder" in original_name and ("running_mean" in original_name or "running_var" in original_name or "num_batches_tracked" in original_name):
+                    sys.stderr.write(f"[DEBUG] Potential buffer not found: {original_name} -> {name}\n")
+                    sys.stderr.write(f"[DEBUG] Is '{name}' in buffers_dict? {name in buffers_dict}\n")
+                    sys.stderr.flush()
+
                 if "audio_projector" in original_name:
                     skipped_weights.append(f"{original_name} -> {name} (NOT IN MODEL)")
                 else:
@@ -770,6 +787,10 @@ class MiDashengLMModel(nn.Module):
         sys.stderr.write(f"\n{'='*80}\n")
         sys.stderr.write(f"[WEIGHT LOADING] Audio encoder weights loaded: {len(audio_encoder_loaded)}\n")
         sys.stderr.write(f"[WEIGHT LOADING] Audio projector weights loaded: {len(audio_projector_loaded)}\n")
+        sys.stderr.write(f"[WEIGHT LOADING] Buffers loaded: {len(buffer_loaded)}\n")
+        if buffer_loaded:
+            for buf in buffer_loaded:
+                sys.stderr.write(f"  - {buf}\n")
         sys.stderr.write(f"[WEIGHT LOADING] Decoder weights passed to language_model: {len(decoder_weights)}\n")
         sys.stderr.write(f"[WEIGHT LOADING] Skipped weights: {len(skipped_weights)}\n")
 
