@@ -674,108 +674,78 @@ class MiDashengLMModel(nn.Module):
         """Load model weights."""
         import sys
 
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
         params_dict = dict(self.named_parameters(remove_duplicate=False))
-
-        # Debug: print audio_projector params in model
-        projector_params = [k for k in params_dict.keys() if 'audio_projector' in k]
-        sys.stderr.write(f"\n[DEBUG] Model has {len(projector_params)} audio_projector params:\n")
-        for p in projector_params:
-            sys.stderr.write(f"  {p}\n")
-        sys.stderr.flush()
 
         audio_encoder_loaded = []
         audio_projector_loaded = []
         skipped_weights = []
-        projector_weight_names = []
+        decoder_weights = []  # Collect decoder weights to pass to language_model
 
         for name, loaded_weight in weights:
-            # Track all audio_projector weights from checkpoint
-            if "audio_projector" in name:
-                projector_weight_names.append(name)
             if "rotary_emb.inv_freq" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 continue
 
-            # Handle stacked parameters (skip audio_encoder)
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name or "audio_encoder" in name or "audio_projector" in name:
-                    continue
-                name_tmp = name.replace(weight_name, param_name)
+            # If it's a decoder weight, collect it for language_model.load_weights()
+            if name.startswith("decoder"):
+                decoder_weights.append((name, loaded_weight))
+                continue
 
-                # Skip loading extra bias for quantized models
-                if name_tmp.endswith(".bias") and name_tmp not in params_dict:
-                    continue
+            # Handle audio encoder and projector weights
+            original_name = name
 
-                if name_tmp not in params_dict:
-                    continue
+            # Handle audio encoder attention qkv weights
+            if "audio_encoder" in name and ".attn.qkv." in name:
+                name = name.replace(".attn.qkv.", ".attn.attn.qkv_proj.")
 
-                param = params_dict[name_tmp]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Handle audio encoder attention weights
-                original_name = name
-                if "audio_encoder" in name and ".attn.qkv." in name:
-                    name = name.replace(".attn.qkv.", ".attn.attn.qkv_proj.")
+            # Handle audio encoder attention output projection
+            if "audio_encoder" in name and ".attn.proj." in name:
+                name = name.replace(".attn.proj.", ".attn.attn.proj.")
 
-                # Handle audio encoder attention output projection
-                # checkpoint: audio_encoder.blocks.X.attn.proj.*
-                # model: audio_encoder.blocks.X.attn.attn.proj.*
-                if "audio_encoder" in name and ".attn.proj." in name:
-                    name = name.replace(".attn.proj.", ".attn.attn.proj.")
+            # Handle audio_projector name mapping: net.0 -> fc1, net.2 -> fc2
+            if "audio_projector" in name:
+                name = name.replace(".net.0.", ".fc1.")
+                name = name.replace(".net.2.", ".fc2.")
 
-                # Handle audio_projector name mapping: net.0 -> fc1, net.2 -> fc2
-                if "audio_projector" in name:
-                    name = name.replace(".net.0.", ".fc1.")
-                    name = name.replace(".net.2.", ".fc2.")
+            # Skip loading extra bias for quantized models
+            if name.endswith(".bias") and name not in params_dict:
+                skipped_weights.append(f"{original_name} (bias not in params)")
+                continue
 
-                # Skip loading extra bias for quantized models
-                if name.endswith(".bias") and name not in params_dict:
-                    skipped_weights.append(f"{original_name} (bias not in params)")
-                    continue
+            if name not in params_dict:
+                if "audio_projector" in original_name:
+                    skipped_weights.append(f"{original_name} -> {name} (NOT IN MODEL PARAMS)")
+                else:
+                    skipped_weights.append(f"{original_name} (not in params)")
+                continue
 
-                if name not in params_dict:
-                    if "audio_projector" in original_name:
-                        # More detailed error for projector weights
-                        skipped_weights.append(f"{original_name} -> {name} (NOT IN MODEL PARAMS)")
-                    else:
-                        skipped_weights.append(f"{original_name} (not in params)")
-                    continue
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
 
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+            # Track what was loaded
+            if "audio_encoder" in original_name:
+                audio_encoder_loaded.append(original_name)
+            elif "audio_projector" in original_name:
+                audio_projector_loaded.append(original_name)
 
-                # Track what was loaded
-                if "audio_encoder" in original_name:
-                    audio_encoder_loaded.append(original_name)
-                elif "audio_projector" in original_name:
-                    audio_projector_loaded.append(original_name)
+        # Pass decoder weights to language_model.load_weights()
+        if decoder_weights:
+            sys.stderr.write(f"\n[WEIGHT LOADING] Passing {len(decoder_weights)} decoder weights to language_model.load_weights()\n")
+            sys.stderr.flush()
+            self.language_model.load_weights(decoder_weights)
 
         # Print summary
         sys.stderr.write(f"\n{'='*80}\n")
-        sys.stderr.write(f"[WEIGHT LOADING] Audio projector weights in checkpoint: {len(projector_weight_names)}\n")
-        if projector_weight_names:
-            sys.stderr.write(f"[WEIGHT LOADING] Projector weight names: {projector_weight_names}\n")
         sys.stderr.write(f"[WEIGHT LOADING] Audio encoder weights loaded: {len(audio_encoder_loaded)}\n")
         sys.stderr.write(f"[WEIGHT LOADING] Audio projector weights loaded: {len(audio_projector_loaded)}\n")
+        sys.stderr.write(f"[WEIGHT LOADING] Decoder weights passed to language_model: {len(decoder_weights)}\n")
         sys.stderr.write(f"[WEIGHT LOADING] Skipped weights: {len(skipped_weights)}\n")
 
         # Analyze skipped weights
-        projector_skipped = [s for s in skipped_weights if 'audio_projector' in s]
         encoder_skipped = [s for s in skipped_weights if 'audio_encoder' in s]
-        other_skipped = [s for s in skipped_weights if 'audio_projector' not in s and 'audio_encoder' not in s]
+        projector_skipped = [s for s in skipped_weights if 'audio_projector' in s]
 
         if projector_skipped:
             sys.stderr.write(f"[WEIGHT LOADING] Skipped audio_projector weights:\n")
@@ -784,19 +754,11 @@ class MiDashengLMModel(nn.Module):
 
         if encoder_skipped:
             sys.stderr.write(f"[WEIGHT LOADING] Skipped audio_encoder weights: {len(encoder_skipped)}\n")
-            # Count by type
-            bias_skipped = [s for s in encoder_skipped if 'bias' in s]
             non_bias_skipped = [s for s in encoder_skipped if 'bias' not in s]
-            sys.stderr.write(f"  Bias weights: {len(bias_skipped)}\n")
-            sys.stderr.write(f"  Non-bias weights: {len(non_bias_skipped)}\n")
             if non_bias_skipped:
                 sys.stderr.write(f"  First 10 non-bias skipped:\n")
                 for s in non_bias_skipped[:10]:
                     sys.stderr.write(f"    {s}\n")
-
-        if other_skipped:
-            sys.stderr.write(f"[WEIGHT LOADING] Other skipped weights: {len(other_skipped)}\n")
-            sys.stderr.write(f"  First 10: {other_skipped[:10]}\n")
 
         sys.stderr.write(f"{'='*80}\n\n")
         sys.stderr.flush()
