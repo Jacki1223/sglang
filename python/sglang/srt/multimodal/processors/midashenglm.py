@@ -117,8 +117,14 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
         )
         sys.stderr.write(f"[PROCESSOR DEBUG] mm_items count: {len(mm_items)}\n")
         sys.stderr.write(f"[PROCESSOR DEBUG] ret keys: {list(ret.keys())}\n")
+        sys.stderr.write(f"[PROCESSOR DEBUG] input_ids shape: {input_ids.shape}\n")
+        sys.stderr.write(f"[PROCESSOR DEBUG] input_ids: {input_ids.tolist()}\n")
+        sys.stderr.write(f"[PROCESSOR DEBUG] audio_token_id={self.audio_token_id}, audio_start_id={self.audio_start_id}, audio_end_id={self.audio_end_id}\n")
+        sys.stderr.write(f"[PROCESSOR DEBUG] Count of audio_token_id in input_ids: {(input_ids == self.audio_token_id).sum().item()}\n")
         for i, item in enumerate(mm_items):
             sys.stderr.write(f"[PROCESSOR DEBUG] mm_item[{i}] modality: {item.modality}\n")
+            sys.stderr.write(f"[PROCESSOR DEBUG] mm_item[{i}] pad_value: {getattr(item, 'pad_value', 'NOT SET')}\n")
+            sys.stderr.write(f"[PROCESSOR DEBUG] mm_item[{i}] offsets: {getattr(item, 'offsets', 'NOT SET')}\n")
             sys.stderr.write(f"[PROCESSOR DEBUG] mm_item[{i}] has feature: {hasattr(item, 'feature')}\n")
             if hasattr(item, 'feature') and item.feature is not None:
                 sys.stderr.write(f"[PROCESSOR DEBUG] mm_item[{i}] feature shape: {item.feature.shape}\n")
