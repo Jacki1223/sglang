@@ -729,6 +729,12 @@ class MiDashengLMModel(nn.Module):
                 if "audio_encoder" in name and ".attn.qkv." in name:
                     name = name.replace(".attn.qkv.", ".attn.attn.qkv_proj.")
 
+                # Handle audio encoder attention output projection
+                # checkpoint: audio_encoder.blocks.X.attn.proj.*
+                # model: audio_encoder.blocks.X.attn.attn.proj.*
+                if "audio_encoder" in name and ".attn.proj." in name:
+                    name = name.replace(".attn.proj.", ".attn.attn.proj.")
+
                 # Handle audio_projector name mapping: net.0 -> fc1, net.2 -> fc2
                 if "audio_projector" in name:
                     name = name.replace(".net.0.", ".fc1.")
