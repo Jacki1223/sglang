@@ -672,6 +672,8 @@ class MiDashengLMModel(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load model weights."""
+        import sys
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -682,6 +684,10 @@ class MiDashengLMModel(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+
+        audio_encoder_loaded = []
+        audio_projector_loaded = []
+        skipped_weights = []
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -708,19 +714,38 @@ class MiDashengLMModel(nn.Module):
                 break
             else:
                 # Handle audio encoder attention weights
+                original_name = name
                 if "audio_encoder" in name and ".attn.qkv." in name:
                     name = name.replace(".attn.qkv.", ".attn.attn.qkv_proj.")
 
                 # Skip loading extra bias for quantized models
                 if name.endswith(".bias") and name not in params_dict:
+                    skipped_weights.append(f"{original_name} (bias not in params)")
                     continue
 
                 if name not in params_dict:
+                    skipped_weights.append(f"{original_name} (not in params)")
                     continue
 
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+                # Track what was loaded
+                if "audio_encoder" in original_name:
+                    audio_encoder_loaded.append(original_name)
+                elif "audio_projector" in original_name:
+                    audio_projector_loaded.append(original_name)
+
+        # Print summary
+        sys.stderr.write(f"\n{'='*80}\n")
+        sys.stderr.write(f"[WEIGHT LOADING] Audio encoder weights loaded: {len(audio_encoder_loaded)}\n")
+        sys.stderr.write(f"[WEIGHT LOADING] Audio projector weights loaded: {len(audio_projector_loaded)}\n")
+        sys.stderr.write(f"[WEIGHT LOADING] Skipped weights: {len(skipped_weights)}\n")
+        if skipped_weights:
+            sys.stderr.write(f"[WEIGHT LOADING] First 10 skipped: {skipped_weights[:10]}\n")
+        sys.stderr.write(f"{'='*80}\n\n")
+        sys.stderr.flush()
 
     def get_embed_and_head(self):
         return self.language_model.model.embed_tokens.weight, self.language_model.lm_head.weight
