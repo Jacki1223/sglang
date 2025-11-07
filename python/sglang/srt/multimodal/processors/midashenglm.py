@@ -88,14 +88,16 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
         Returns:
             Dictionary containing processed multimodal data
         """
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.info(f"[PROCESSOR DEBUG] process_mm_data_async called with audio_data={audio_data is not None}")
+        print(f"\n{'='*80}")
+        print(f"[PROCESSOR DEBUG] process_mm_data_async called")
+        print(f"[PROCESSOR DEBUG] audio_data is not None: {audio_data is not None}")
+        print(f"[PROCESSOR DEBUG] input_text: {input_text}")
+        print(f"{'='*80}\n")
 
         # Automatically prepend audio token if not present
         if audio_data and not self.AUDIO_TOKEN_REGEX.search(input_text):
             input_text = f"{self.AUDIO_TOKEN}{input_text}"
-            logger.info(f"[PROCESSOR DEBUG] Auto-prepended audio token, new input_text: {input_text}")
+            print(f"[PROCESSOR DEBUG] Auto-prepended audio token, new input_text: {input_text}")
 
         base_output = self.load_mm_data(
             prompt=input_text,
@@ -103,15 +105,19 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             multimodal_tokens=self.mm_tokens,
         )
         if base_output is None:
-            logger.info(f"[PROCESSOR DEBUG] base_output is None, returning None")
+            print(f"[PROCESSOR DEBUG] base_output is None, returning None")
             return None
 
         mm_items, input_ids, ret = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
-        logger.info(f"[PROCESSOR DEBUG] mm_items count: {len(mm_items)}")
+        print(f"[PROCESSOR DEBUG] mm_items count: {len(mm_items)}")
+        print(f"[PROCESSOR DEBUG] ret keys: {list(ret.keys())}")
         for i, item in enumerate(mm_items):
-            logger.info(f"[PROCESSOR DEBUG] mm_item[{i}] modality: {item.modality}, has_feature: {hasattr(item, 'feature')}")
+            print(f"[PROCESSOR DEBUG] mm_item[{i}] modality: {item.modality}")
+            print(f"[PROCESSOR DEBUG] mm_item[{i}] has feature attr: {hasattr(item, 'feature')}")
+            if hasattr(item, 'feature') and item.feature is not None:
+                print(f"[PROCESSOR DEBUG] mm_item[{i}] feature shape: {item.feature.shape}")
 
         # MiDashengLM processor returns input_values (audio waveforms)
         # We need to extract audio_length from the input_values shape
@@ -121,7 +127,7 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             # For MiDashengLM, audio_length is the actual waveform length
             audio_length = input_values.shape[-1] if input_values.ndim >= 2 else input_values.shape[0]
             mm_items[0].audio_length = audio_length
-            logger.info(f"[PROCESSOR DEBUG] Set audio_length={audio_length}, input_values shape: {input_values.shape}")
+            print(f"[PROCESSOR DEBUG] Set audio_length={audio_length}, input_values shape: {input_values.shape}")
 
         result = {
             "mm_items": mm_items,
@@ -130,5 +136,5 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             "audio_token_id": self.audio_token_id,
             "audio_end_id": self.audio_end_id,
         }
-        logger.info(f"[PROCESSOR DEBUG] Returning {len(result['mm_items'])} mm_items")
+        print(f"[PROCESSOR DEBUG] Returning {len(result['mm_items'])} mm_items\n")
         return result
