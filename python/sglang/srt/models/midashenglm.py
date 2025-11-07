@@ -617,26 +617,14 @@ class MiDashengLMModel(nn.Module):
 
         batch_size, max_audio_tokens, embed_dim = audio_embeddings.shape
 
-        # Calculate output lengths for each audio
-        audio_output_lengths = [
-            max(1, calculate_mel_frames_dasheng(int(length)))
-            for length in audio_length.tolist()
-        ]
-        audio_output_lengths_tensor = torch.tensor(
-            audio_output_lengths,
-            device=audio_embeddings.device,
-        )
-        sys.stderr.write(f"[MODEL DEBUG] audio_output_lengths: {audio_output_lengths}\n")
+        # Use the actual output from projector instead of calculating
+        # This ensures we don't miss or incorrectly truncate audio features
+        sys.stderr.write(f"[MODEL DEBUG] Using all {max_audio_tokens} audio tokens from projector output\n")
         sys.stderr.flush()
 
-        # Create mask and extract valid features
-        audio_feature_mask = torch.arange(
-            max_audio_tokens, device=audio_embeddings.device
-        ).unsqueeze(0).expand(
-            batch_size, max_audio_tokens
-        ) < audio_output_lengths_tensor.unsqueeze(1)
-
-        masked_audio_features = audio_embeddings[audio_feature_mask].view(-1, embed_dim)
+        # Simply reshape to flatten batch dimension
+        # All tokens from projector output are valid
+        masked_audio_features = audio_embeddings.reshape(-1, embed_dim)
         sys.stderr.write(f"[MODEL DEBUG] Final output shape: {masked_audio_features.shape}\n")
         sys.stderr.write(f"[MODEL DEBUG] Stats: min={masked_audio_features.min().item():.4f}, max={masked_audio_features.max().item():.4f}\n")
         sys.stderr.write(f"[MODEL DEBUG] Audio embeddings dtype: {masked_audio_features.dtype}, device: {masked_audio_features.device}\n")
