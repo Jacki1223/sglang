@@ -772,15 +772,32 @@ class MiDashengLMModel(nn.Module):
         sys.stderr.write(f"[WEIGHT LOADING] Audio projector weights loaded: {len(audio_projector_loaded)}\n")
         sys.stderr.write(f"[WEIGHT LOADING] Skipped weights: {len(skipped_weights)}\n")
 
-        # Show specifically skipped projector weights
+        # Analyze skipped weights
         projector_skipped = [s for s in skipped_weights if 'audio_projector' in s]
+        encoder_skipped = [s for s in skipped_weights if 'audio_encoder' in s]
+        other_skipped = [s for s in skipped_weights if 'audio_projector' not in s and 'audio_encoder' not in s]
+
         if projector_skipped:
             sys.stderr.write(f"[WEIGHT LOADING] Skipped audio_projector weights:\n")
             for s in projector_skipped:
                 sys.stderr.write(f"  {s}\n")
-        else:
-            if skipped_weights:
-                sys.stderr.write(f"[WEIGHT LOADING] First 10 skipped: {skipped_weights[:10]}\n")
+
+        if encoder_skipped:
+            sys.stderr.write(f"[WEIGHT LOADING] Skipped audio_encoder weights: {len(encoder_skipped)}\n")
+            # Count by type
+            bias_skipped = [s for s in encoder_skipped if 'bias' in s]
+            non_bias_skipped = [s for s in encoder_skipped if 'bias' not in s]
+            sys.stderr.write(f"  Bias weights: {len(bias_skipped)}\n")
+            sys.stderr.write(f"  Non-bias weights: {len(non_bias_skipped)}\n")
+            if non_bias_skipped:
+                sys.stderr.write(f"  First 10 non-bias skipped:\n")
+                for s in non_bias_skipped[:10]:
+                    sys.stderr.write(f"    {s}\n")
+
+        if other_skipped:
+            sys.stderr.write(f"[WEIGHT LOADING] Other skipped weights: {len(other_skipped)}\n")
+            sys.stderr.write(f"  First 10: {other_skipped[:10]}\n")
+
         sys.stderr.write(f"{'='*80}\n\n")
         sys.stderr.flush()
 
