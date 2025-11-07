@@ -665,6 +665,25 @@ class MiDashengLMModel(nn.Module):
             positions: Flattened (concatenated) position ids corresponding to a batch.
             forward_batch: Forward batch information including multimodal data.
         """
+        # Debug: Check if input_ids has been padded with pad_value
+        import sys
+        if forward_batch.contains_mm_inputs():
+            sys.stderr.write("\n" + "="*80 + "\n")
+            sys.stderr.write(f"[FORWARD DEBUG] input_ids shape: {input_ids.shape}\n")
+            sys.stderr.write(f"[FORWARD DEBUG] input_ids first 20: {input_ids[:20].tolist()}\n")
+            sys.stderr.write(f"[FORWARD DEBUG] input_ids unique values count: {len(torch.unique(input_ids))}\n")
+            if forward_batch.mm_inputs and len(forward_batch.mm_inputs) > 0:
+                mm_input = forward_batch.mm_inputs[0]
+                if mm_input and len(mm_input.mm_items) > 0:
+                    pad_value = mm_input.mm_items[0].pad_value
+                    sys.stderr.write(f"[FORWARD DEBUG] Expected pad_value: {pad_value}\n")
+                    sys.stderr.write(f"[FORWARD DEBUG] Count of pad_value in input_ids: {(input_ids == pad_value).sum().item()}\n")
+                    if hasattr(mm_input, 'audio_token_id') and mm_input.audio_token_id:
+                        sys.stderr.write(f"[FORWARD DEBUG] audio_token_id: {mm_input.audio_token_id}\n")
+                        sys.stderr.write(f"[FORWARD DEBUG] Count of audio_token_id in input_ids: {(input_ids == mm_input.audio_token_id).sum().item()}\n")
+            sys.stderr.write("="*80 + "\n\n")
+            sys.stderr.flush()
+
         # Process multimodal inputs through language model (matches Qwen2Audio pattern)
         return general_mm_embed_routine(
             input_ids=input_ids,
