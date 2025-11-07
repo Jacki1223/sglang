@@ -686,6 +686,8 @@ class MiDashengLMModel(nn.Module):
         import sys
 
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        # Also include buffers (for mel_scale, spectrogram window, etc.)
+        buffers_dict = dict(self.named_buffers())
 
         audio_encoder_loaded = []
         audio_projector_loaded = []
@@ -706,6 +708,13 @@ class MiDashengLMModel(nn.Module):
             # Handle audio encoder and projector weights
             original_name = name
 
+            # Handle audio encoder frontend buffers (mel_scale and spectrogram window)
+            if "audio_encoder.front_end" in name:
+                if ".mel_scale.fb" in name:
+                    name = name.replace(".mel_scale.fb", ".melscale_fbanks")
+                elif ".spectrogram.window" in name:
+                    name = name.replace(".spectrogram.window", ".spectrogram_window")
+
             # Handle audio encoder attention qkv weights
             if "audio_encoder" in name and ".attn.qkv." in name:
                 name = name.replace(".attn.qkv.", ".attn.attn.qkv_proj.")
@@ -720,20 +729,24 @@ class MiDashengLMModel(nn.Module):
                 name = name.replace(".net.2.", ".fc2.")
 
             # Skip loading extra bias for quantized models
-            if name.endswith(".bias") and name not in params_dict:
-                skipped_weights.append(f"{original_name} (bias not in params)")
+            if name.endswith(".bias") and name not in params_dict and name not in buffers_dict:
+                skipped_weights.append(f"{original_name} (bias not in params/buffers)")
                 continue
 
-            if name not in params_dict:
+            # Try to load as parameter first, then as buffer
+            if name in params_dict:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+            elif name in buffers_dict:
+                # Load as buffer (e.g., mel_scale, spectrogram window, BatchNorm stats)
+                buffers_dict[name].copy_(loaded_weight)
+            else:
                 if "audio_projector" in original_name:
-                    skipped_weights.append(f"{original_name} -> {name} (NOT IN MODEL PARAMS)")
+                    skipped_weights.append(f"{original_name} -> {name} (NOT IN MODEL)")
                 else:
-                    skipped_weights.append(f"{original_name} (not in params)")
+                    skipped_weights.append(f"{original_name} (not in model)")
                 continue
-
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
 
             # Track what was loaded
             if "audio_encoder" in original_name:
