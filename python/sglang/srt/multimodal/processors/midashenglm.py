@@ -88,21 +88,19 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
         Returns:
             Dictionary containing processed multimodal data
         """
-        # Write to file for debugging since print may go to subprocess
-        with open("/tmp/midashenglm_debug.log", "a") as f:
-            f.write(f"\n{'='*80}\n")
-            f.write(f"[PROCESSOR DEBUG] process_mm_data_async called\n")
-            f.write(f"[PROCESSOR DEBUG] audio_data is not None: {audio_data is not None}\n")
-            f.write(f"[PROCESSOR DEBUG] input_text: {input_text}\n")
-            f.write(f"{'='*80}\n\n")
-            f.flush()
+        import sys
+        sys.stderr.write("\n" + "="*80 + "\n")
+        sys.stderr.write("[PROCESSOR DEBUG] process_mm_data_async called\n")
+        sys.stderr.write(f"[PROCESSOR DEBUG] audio_data is not None: {audio_data is not None}\n")
+        sys.stderr.write(f"[PROCESSOR DEBUG] input_text: {input_text}\n")
+        sys.stderr.write("="*80 + "\n\n")
+        sys.stderr.flush()
 
         # Automatically prepend audio token if not present
         if audio_data and not self.AUDIO_TOKEN_REGEX.search(input_text):
             input_text = f"{self.AUDIO_TOKEN}{input_text}"
-            with open("/tmp/midashenglm_debug.log", "a") as f:
-                f.write(f"[PROCESSOR DEBUG] Auto-prepended audio token, new input_text: {input_text}\n")
-                f.flush()
+            sys.stderr.write(f"[PROCESSOR DEBUG] Auto-prepended audio token\n")
+            sys.stderr.flush()
 
         base_output = self.load_mm_data(
             prompt=input_text,
@@ -110,23 +108,21 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             multimodal_tokens=self.mm_tokens,
         )
         if base_output is None:
-            with open("/tmp/midashenglm_debug.log", "a") as f:
-                f.write(f"[PROCESSOR DEBUG] base_output is None, returning None\n")
-                f.flush()
+            sys.stderr.write("[PROCESSOR DEBUG] base_output is None\n")
+            sys.stderr.flush()
             return None
 
         mm_items, input_ids, ret = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
-        with open("/tmp/midashenglm_debug.log", "a") as f:
-            f.write(f"[PROCESSOR DEBUG] mm_items count: {len(mm_items)}\n")
-            f.write(f"[PROCESSOR DEBUG] ret keys: {list(ret.keys())}\n")
-            for i, item in enumerate(mm_items):
-                f.write(f"[PROCESSOR DEBUG] mm_item[{i}] modality: {item.modality}\n")
-                f.write(f"[PROCESSOR DEBUG] mm_item[{i}] has feature attr: {hasattr(item, 'feature')}\n")
-                if hasattr(item, 'feature') and item.feature is not None:
-                    f.write(f"[PROCESSOR DEBUG] mm_item[{i}] feature shape: {item.feature.shape}\n")
-            f.flush()
+        sys.stderr.write(f"[PROCESSOR DEBUG] mm_items count: {len(mm_items)}\n")
+        sys.stderr.write(f"[PROCESSOR DEBUG] ret keys: {list(ret.keys())}\n")
+        for i, item in enumerate(mm_items):
+            sys.stderr.write(f"[PROCESSOR DEBUG] mm_item[{i}] modality: {item.modality}\n")
+            sys.stderr.write(f"[PROCESSOR DEBUG] mm_item[{i}] has feature: {hasattr(item, 'feature')}\n")
+            if hasattr(item, 'feature') and item.feature is not None:
+                sys.stderr.write(f"[PROCESSOR DEBUG] mm_item[{i}] feature shape: {item.feature.shape}\n")
+        sys.stderr.flush()
 
         # MiDashengLM processor returns input_values (audio waveforms)
         # We need to extract audio_length from the input_values shape
@@ -136,9 +132,8 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             # For MiDashengLM, audio_length is the actual waveform length
             audio_length = input_values.shape[-1] if input_values.ndim >= 2 else input_values.shape[0]
             mm_items[0].audio_length = audio_length
-            with open("/tmp/midashenglm_debug.log", "a") as f:
-                f.write(f"[PROCESSOR DEBUG] Set audio_length={audio_length}, input_values shape: {input_values.shape}\n")
-                f.flush()
+            sys.stderr.write(f"[PROCESSOR DEBUG] Set audio_length={audio_length}\n")
+            sys.stderr.flush()
 
         result = {
             "mm_items": mm_items,
@@ -147,7 +142,6 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             "audio_token_id": self.audio_token_id,
             "audio_end_id": self.audio_end_id,
         }
-        with open("/tmp/midashenglm_debug.log", "a") as f:
-            f.write(f"[PROCESSOR DEBUG] Returning {len(result['mm_items'])} mm_items\n\n")
-            f.flush()
+        sys.stderr.write(f"[PROCESSOR DEBUG] Returning {len(result['mm_items'])} mm_items\n\n")
+        sys.stderr.flush()
         return result
