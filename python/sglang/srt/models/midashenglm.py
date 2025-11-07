@@ -729,6 +729,11 @@ class MiDashengLMModel(nn.Module):
                 if "audio_encoder" in name and ".attn.qkv." in name:
                     name = name.replace(".attn.qkv.", ".attn.attn.qkv_proj.")
 
+                # Handle audio_projector name mapping: net.0 -> fc1, net.2 -> fc2
+                if "audio_projector" in name:
+                    name = name.replace(".net.0.", ".fc1.")
+                    name = name.replace(".net.2.", ".fc2.")
+
                 # Skip loading extra bias for quantized models
                 if name.endswith(".bias") and name not in params_dict:
                     skipped_weights.append(f"{original_name} (bias not in params)")
