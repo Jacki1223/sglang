@@ -200,13 +200,15 @@ Log Mel-spectrogram [B, 1, 64, time]
 
 | HuggingFace权重名称 | SGLang模型参数名称 | 映射规则 |
 |---------------------|-------------------|----------|
-| `audio_encoder.front_end.mel_scale.fb` | `audio_encoder.front_end.melscale_fbanks` | Buffer名称映射 |
-| `audio_encoder.front_end.spectrogram.window` | `audio_encoder.front_end.spectrogram_window` | Buffer名称映射 |
+| `audio_encoder.front_end.0.mel_scale.fb` | `audio_encoder.front_end.melscale_fbanks` | 移除`.0.` + Buffer名称映射 |
+| `audio_encoder.front_end.0.spectrogram.window` | `audio_encoder.front_end.spectrogram_window` | 移除`.0.` + Buffer名称映射 |
 | `audio_encoder.blocks.*.attn.qkv.*` | `audio_encoder.blocks.*.attn.attn.qkv_proj.*` | 嵌套VisionAttention |
 | `audio_encoder.blocks.*.attn.proj.*` | `audio_encoder.blocks.*.attn.attn.proj.*` | 嵌套VisionAttention |
 | `audio_projector.net.0.*` | `audio_projector.fc1.*` | 层名称映射 |
 | `audio_projector.net.2.*` | `audio_projector.fc2.*` | 层名称映射 |
 | `decoder.*` | (传递给language_model) | 剥离"decoder."前缀 |
+
+**⚠️ 关键发现**: HuggingFace权重中的`front_end`后有额外的`.0.`（可能是Sequential容器导致），必须先移除才能正确映射！
 
 ### 3.3 初始化流程
 
@@ -307,9 +309,69 @@ output = language_model(final_embeddings, ...)
 
 ---
 
-## 五、问题修复建议
+## 五、实际问题发现与修复
 
-### 5.1 立即行动项
+### 5.1 音频前端Buffer加载失败（已修复）
+
+**问题症状**（从实际日志）:
+```
+[WEIGHT LOADING] Skipped audio_encoder weights: 2
+  First 10 non-bias skipped:
+    audio_encoder.front_end.0.mel_scale.fb (not in model)
+    audio_encoder.front_end.0.spectrogram.window (not in model)
+```
+
+**根本原因**:
+- HuggingFace权重名称: `audio_encoder.front_end.0.mel_scale.fb`
+- 模型buffer名称: `audio_encoder.front_end.melscale_fbanks`
+- 原映射逻辑**漏掉了** `.0.` 的处理！
+
+**影响**:
+- ❌ Mel-scale滤波器组未加载（影响音频预处理）
+- ❌ STFT窗函数未加载（影响频谱计算）
+- 🔴 这会导致**音频处理结果完全错误**！
+
+**修复方案**（已实施）:
+```python
+if "audio_encoder.front_end" in name:
+    # 先移除HuggingFace权重中的额外 ".0."
+    name = name.replace("front_end.0.", "front_end.")
+
+    # 然后进行buffer名称映射
+    if ".mel_scale.fb" in name:
+        name = name.replace(".mel_scale.fb", ".melscale_fbanks")
+    elif ".spectrogram.window" in name:
+        name = name.replace(".spectrogram.window", ".spectrogram_window")
+```
+
+**修复后预期**:
+- ✅ `audio_encoder.front_end.0.mel_scale.fb` → `audio_encoder.front_end.melscale_fbanks`
+- ✅ `audio_encoder.front_end.0.spectrogram.window` → `audio_encoder.front_end.spectrogram_window`
+- ✅ Skipped weights 应减少2个（从4个→2个）
+
+### 5.2 Audio Projector Bias跳过（预期行为）
+
+**日志显示**:
+```
+[WEIGHT LOADING] Skipped audio_projector weights:
+  audio_projector.net.0.bias (bias not in params/buffers)
+  audio_projector.net.2.bias (bias not in params/buffers)
+```
+
+**原因分析**:
+SGLang的AudioProjectorSubsample使用 `bias=False`:
+```python
+self.fc1 = ColumnParallelLinear(..., bias=False)
+self.fc2 = RowParallelLinear(..., bias=False)
+```
+
+**结论**: ✅ 这是**正常行为**，不是bug
+
+---
+
+## 六、增强功能建议
+
+### 6.1 立即行动项
 
 #### 修复1: 增强load_weights的调试输出
 

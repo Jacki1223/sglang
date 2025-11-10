@@ -721,6 +721,11 @@ class MiDashengLMModel(nn.Module):
 
             # Handle audio encoder frontend buffers (mel_scale and spectrogram window)
             if "audio_encoder.front_end" in name:
+                # HuggingFace weights have an extra ".0." in the path
+                # e.g., "audio_encoder.front_end.0.mel_scale.fb"
+                # but our model has "audio_encoder.front_end.melscale_fbanks"
+                name = name.replace("front_end.0.", "front_end.")
+
                 if ".mel_scale.fb" in name:
                     name = name.replace(".mel_scale.fb", ".melscale_fbanks")
                 elif ".spectrogram.window" in name:
