@@ -91,16 +91,16 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
         Returns:
             Dictionary containing processed multimodal data
         """
-        logger.debug("="*80)
-        logger.debug("process_mm_data_async called")
-        logger.debug(f"audio_data is not None: {audio_data is not None}")
-        logger.debug(f"input_text: {input_text}")
-        logger.debug("="*80)
+        logger.info("="*80)
+        logger.info("process_mm_data_async called")
+        logger.info(f"audio_data is not None: {audio_data is not None}")
+        logger.info(f"input_text: {input_text}")
+        logger.info("="*80)
 
         # Automatically prepend audio token if not present
         if audio_data and not self.AUDIO_TOKEN_REGEX.search(input_text):
             input_text = f"{self.AUDIO_TOKEN}{input_text}"
-            logger.debug("Auto-prepended audio token")
+            logger.info("Auto-prepended audio token")
 
         base_output = self.load_mm_data(
             prompt=input_text,
@@ -108,25 +108,25 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             multimodal_tokens=self.mm_tokens,
         )
         if base_output is None:
-            logger.debug("base_output is None")
+            logger.info("base_output is None")
             return None
 
         mm_items, input_ids, ret = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
-        logger.debug(f"mm_items count: {len(mm_items)}")
-        logger.debug(f"ret keys: {list(ret.keys())}")
-        logger.debug(f"input_ids shape: {input_ids.shape}")
-        logger.debug(f"input_ids: {input_ids.tolist()}")
-        logger.debug(f"audio_token_id={self.audio_token_id}, audio_start_id={self.audio_start_id}, audio_end_id={self.audio_end_id}")
-        logger.debug(f"Count of audio_token_id in input_ids: {(input_ids == self.audio_token_id).sum().item()}")
+        logger.info(f"mm_items count: {len(mm_items)}")
+        logger.info(f"ret keys: {list(ret.keys())}")
+        logger.info(f"input_ids shape: {input_ids.shape}")
+        logger.info(f"input_ids: {input_ids.tolist()}")
+        logger.info(f"audio_token_id={self.audio_token_id}, audio_start_id={self.audio_start_id}, audio_end_id={self.audio_end_id}")
+        logger.info(f"Count of audio_token_id in input_ids: {(input_ids == self.audio_token_id).sum().item()}")
         for i, item in enumerate(mm_items):
-            logger.debug(f"mm_item[{i}] modality: {item.modality}")
-            logger.debug(f"mm_item[{i}] pad_value: {getattr(item, 'pad_value', 'NOT SET')}")
-            logger.debug(f"mm_item[{i}] offsets: {getattr(item, 'offsets', 'NOT SET')}")
-            logger.debug(f"mm_item[{i}] has feature: {hasattr(item, 'feature')}")
+            logger.info(f"mm_item[{i}] modality: {item.modality}")
+            logger.info(f"mm_item[{i}] pad_value: {getattr(item, 'pad_value', 'NOT SET')}")
+            logger.info(f"mm_item[{i}] offsets: {getattr(item, 'offsets', 'NOT SET')}")
+            logger.info(f"mm_item[{i}] has feature: {hasattr(item, 'feature')}")
             if hasattr(item, 'feature') and item.feature is not None:
-                logger.debug(f"mm_item[{i}] feature shape: {item.feature.shape}")
+                logger.info(f"mm_item[{i}] feature shape: {item.feature.shape}")
 
         # MiDashengLM processor returns audio_length from feature_extractor
         # This is the mel-spectrogram frame count, NOT the waveform length
@@ -137,13 +137,13 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             if isinstance(audio_length, torch.Tensor):
                 audio_length = audio_length.item() if audio_length.numel() == 1 else audio_length[0].item()
             mm_items[0].audio_length = audio_length
-            logger.debug(f"Set audio_length={audio_length} (from processor, mel frame count)")
+            logger.info(f"Set audio_length={audio_length} (from processor, mel frame count)")
         elif "input_values" in ret and len(mm_items) > 0:
             # Fallback: use waveform length if audio_length not provided
             input_values = ret["input_values"]
             audio_length = input_values.shape[-1] if input_values.ndim >= 2 else input_values.shape[0]
             mm_items[0].audio_length = audio_length
-            logger.debug(f"Set audio_length={audio_length} (fallback, waveform length)")
+            logger.info(f"Set audio_length={audio_length} (fallback, waveform length)")
 
         result = {
             "mm_items": mm_items,
@@ -152,5 +152,5 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             "audio_token_id": self.audio_token_id,
             "audio_end_id": self.audio_end_id,
         }
-        logger.debug(f"Returning {len(result['mm_items'])} mm_items")
+        logger.info(f"Returning {len(result['mm_items'])} mm_items")
         return result

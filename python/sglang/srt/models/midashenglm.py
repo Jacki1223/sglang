@@ -580,17 +580,17 @@ class MiDashengLMModel(nn.Module):
         Returns:
             audio_embeddings: Concatenated audio embeddings
         """
-        logger.debug("="*80)
-        logger.debug(f"get_audio_feature called with {len(items)} items")
-        logger.debug("="*80)
+        logger.info("="*80)
+        logger.info(f"get_audio_feature called with {len(items)} items")
+        logger.info("="*80)
         for i, item in enumerate(items):
-            logger.debug(f"Item {i} feature shape: {item.feature.shape}")
-            logger.debug(f"Item {i} audio_length: {getattr(item, 'audio_length', 'NOT SET')}")
-            logger.debug(f"Item {i} pad_value: {getattr(item, 'pad_value', 'NOT SET')}")
-            logger.debug(f"Item {i} hash: {getattr(item, 'hash', 'NOT SET')}")
+            logger.info(f"Item {i} feature shape: {item.feature.shape}")
+            logger.info(f"Item {i} audio_length: {getattr(item, 'audio_length', 'NOT SET')}")
+            logger.info(f"Item {i} pad_value: {getattr(item, 'pad_value', 'NOT SET')}")
+            logger.info(f"Item {i} hash: {getattr(item, 'hash', 'NOT SET')}")
 
         input_values = torch.cat([item.feature for item in items], dim=0)
-        logger.debug(f"Concatenated input_values shape: {input_values.shape}")
+        logger.info(f"Concatenated input_values shape: {input_values.shape}")
 
         # Get audio lengths if available
         audio_lengths = []
@@ -602,30 +602,30 @@ class MiDashengLMModel(nn.Module):
                 audio_lengths.append(item.feature.shape[-1])
 
         audio_length = torch.tensor(audio_lengths, device=input_values.device)
-        logger.debug(f"audio_length: {audio_length}")
+        logger.info(f"audio_length: {audio_length}")
 
         # Process through encoder and projector
         encoder_out, encoder_atts = self.audio_encoder(input_values, audio_length)
-        logger.debug(f"Encoder output shape: {encoder_out.shape}")
+        logger.info(f"Encoder output shape: {encoder_out.shape}")
 
         audio_embeddings, _ = self.audio_projector(encoder_out, encoder_atts)
         audio_embeddings = audio_embeddings.to(input_values.dtype)
-        logger.debug(f"Projector output shape: {audio_embeddings.shape}")
+        logger.info(f"Projector output shape: {audio_embeddings.shape}")
 
         batch_size, max_audio_tokens, embed_dim = audio_embeddings.shape
 
         # Use the actual output from projector instead of calculating
         # This ensures we don't miss or incorrectly truncate audio features
-        logger.debug(f"Using all {max_audio_tokens} audio tokens from projector output")
+        logger.info(f"Using all {max_audio_tokens} audio tokens from projector output")
 
         # Simply reshape to flatten batch dimension
         # All tokens from projector output are valid
         masked_audio_features = audio_embeddings.reshape(-1, embed_dim)
-        logger.debug(f"Final output shape: {masked_audio_features.shape}")
-        logger.debug(f"Stats: min={masked_audio_features.min().item():.4f}, max={masked_audio_features.max().item():.4f}")
-        logger.debug(f"Audio embeddings dtype: {masked_audio_features.dtype}, device: {masked_audio_features.device}")
-        logger.debug(f"First 5 values of first audio token: {masked_audio_features[0, :5].tolist()}")
-        logger.debug("="*80)
+        logger.info(f"Final output shape: {masked_audio_features.shape}")
+        logger.info(f"Stats: min={masked_audio_features.min().item():.4f}, max={masked_audio_features.max().item():.4f}")
+        logger.info(f"Audio embeddings dtype: {masked_audio_features.dtype}, device: {masked_audio_features.device}")
+        logger.info(f"First 5 values of first audio token: {masked_audio_features[0, :5].tolist()}")
+        logger.info("="*80)
 
         # Return concatenated audio embeddings (all valid audio tokens in sequence)
         return masked_audio_features
@@ -650,20 +650,20 @@ class MiDashengLMModel(nn.Module):
         """
         # Debug: Check if input_ids has been padded with pad_value
         if forward_batch.contains_mm_inputs():
-            logger.debug("="*80)
-            logger.debug(f"input_ids shape: {input_ids.shape}")
-            logger.debug(f"input_ids first 20: {input_ids[:20].tolist()}")
-            logger.debug(f"input_ids unique values count: {len(torch.unique(input_ids))}")
+            logger.info("="*80)
+            logger.info(f"input_ids shape: {input_ids.shape}")
+            logger.info(f"input_ids first 20: {input_ids[:20].tolist()}")
+            logger.info(f"input_ids unique values count: {len(torch.unique(input_ids))}")
             if forward_batch.mm_inputs and len(forward_batch.mm_inputs) > 0:
                 mm_input = forward_batch.mm_inputs[0]
                 if mm_input and len(mm_input.mm_items) > 0:
                     pad_value = mm_input.mm_items[0].pad_value
-                    logger.debug(f"Expected pad_value: {pad_value}")
-                    logger.debug(f"Count of pad_value in input_ids: {(input_ids == pad_value).sum().item()}")
+                    logger.info(f"Expected pad_value: {pad_value}")
+                    logger.info(f"Count of pad_value in input_ids: {(input_ids == pad_value).sum().item()}")
                     if hasattr(mm_input, 'audio_token_id') and mm_input.audio_token_id:
-                        logger.debug(f"audio_token_id: {mm_input.audio_token_id}")
-                        logger.debug(f"Count of audio_token_id in input_ids: {(input_ids == mm_input.audio_token_id).sum().item()}")
-            logger.debug("="*80)
+                        logger.info(f"audio_token_id: {mm_input.audio_token_id}")
+                        logger.info(f"Count of audio_token_id in input_ids: {(input_ids == mm_input.audio_token_id).sum().item()}")
+            logger.info("="*80)
 
         # Process multimodal inputs through language model (matches Qwen2Audio pattern)
         return general_mm_embed_routine(
