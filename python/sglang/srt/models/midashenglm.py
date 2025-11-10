@@ -684,6 +684,17 @@ class MiDashengLMModel(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load model weights."""
         import sys
+        import re
+        from collections import defaultdict
+
+        # Convert to list to enable multiple passes and counting
+        weights_list = list(weights)
+
+        sys.stderr.write(f"\n{'='*80}\n")
+        sys.stderr.write(f"[WEIGHT LOADING] Starting weight loading for MiDashengLM\n")
+        sys.stderr.write(f"[WEIGHT LOADING] Total weights received from iterator: {len(weights_list)}\n")
+        sys.stderr.write(f"{'='*80}\n\n")
+        sys.stderr.flush()
 
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         # Also include buffers (for mel_scale, spectrogram window, etc.)
@@ -694,7 +705,7 @@ class MiDashengLMModel(nn.Module):
         skipped_weights = []
         decoder_weights = []  # Collect decoder weights to pass to language_model
 
-        for name, loaded_weight in weights:
+        for name, loaded_weight in weights_list:
             if "rotary_emb.inv_freq" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
@@ -757,8 +768,67 @@ class MiDashengLMModel(nn.Module):
         # Pass decoder weights to language_model.load_weights()
         # Strip "decoder." prefix since language_model expects weights without it
         if decoder_weights:
+            sys.stderr.write(f"\n[WEIGHT LOADING] Decoder weights breakdown:\n")
+
+            # Detailed decoder weight statistics
+            decoder_by_component = defaultdict(int)
+            decoder_by_layer = defaultdict(int)
+            total_decoder_params = 0
+
+            for name, weight in decoder_weights:
+                total_decoder_params += weight.numel()
+
+                # Categorize by component type
+                if "embed_tokens" in name:
+                    decoder_by_component["embed_tokens"] += 1
+                elif "lm_head" in name:
+                    decoder_by_component["lm_head"] += 1
+                elif "norm" in name and "layers" not in name:
+                    decoder_by_component["final_norm"] += 1
+                elif "layers" in name:
+                    # Extract layer number
+                    layer_match = re.search(r'layers\.(\d+)', name)
+                    if layer_match:
+                        layer_id = int(layer_match.group(1))
+                        decoder_by_layer[layer_id] += 1
+
+                        # Categorize by weight type
+                        if "self_attn" in name:
+                            decoder_by_component["attention"] += 1
+                        elif "mlp" in name:
+                            decoder_by_component["mlp"] += 1
+                        elif "input_layernorm" in name or "post_attention_layernorm" in name:
+                            decoder_by_component["layernorm"] += 1
+
+            # Print statistics
+            sys.stderr.write(f"  Total decoder weights: {len(decoder_weights)}\n")
+            sys.stderr.write(f"  Total decoder parameters: {total_decoder_params:,}\n")
+            sys.stderr.write(f"\n  By component:\n")
+            for comp, count in sorted(decoder_by_component.items()):
+                sys.stderr.write(f"    {comp}: {count} weights\n")
+
+            if decoder_by_layer:
+                num_layers = len(decoder_by_layer)
+                sys.stderr.write(f"\n  Decoder layers found: {num_layers}\n")
+                sys.stderr.write(f"  Layer coverage: {min(decoder_by_layer.keys())} to {max(decoder_by_layer.keys())}\n")
+
+                # Check for missing layers
+                expected_layers = set(range(32))  # Assuming 32 layers for 7B model
+                actual_layers = set(decoder_by_layer.keys())
+                missing_layers = expected_layers - actual_layers
+                if missing_layers:
+                    sys.stderr.write(f"  ⚠️  Missing layers: {sorted(missing_layers)}\n")
+                else:
+                    sys.stderr.write(f"  ✓ All layers present\n")
+
+                # Show weight count distribution
+                min_weights = min(decoder_by_layer.values())
+                max_weights = max(decoder_by_layer.values())
+                sys.stderr.write(f"  Weights per layer: min={min_weights}, max={max_weights}\n")
+
             sys.stderr.write(f"\n[WEIGHT LOADING] Passing {len(decoder_weights)} decoder weights to language_model.load_weights()\n")
             sys.stderr.flush()
+
             # Remove "decoder." prefix from weight names
             decoder_weights_stripped = [
                 (name.replace("decoder.", "", 1), weight)
