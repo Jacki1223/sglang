@@ -1,3 +1,4 @@
+import logging
 import re
 import torch
 from sglang.srt.managers.schedule_batch import Modality
@@ -6,6 +7,8 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
@@ -88,19 +91,16 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
         Returns:
             Dictionary containing processed multimodal data
         """
-        import sys
-        sys.stderr.write("\n" + "="*80 + "\n")
-        sys.stderr.write("[PROCESSOR DEBUG] process_mm_data_async called\n")
-        sys.stderr.write(f"[PROCESSOR DEBUG] audio_data is not None: {audio_data is not None}\n")
-        sys.stderr.write(f"[PROCESSOR DEBUG] input_text: {input_text}\n")
-        sys.stderr.write("="*80 + "\n\n")
-        sys.stderr.flush()
+        logger.debug("="*80)
+        logger.debug("process_mm_data_async called")
+        logger.debug(f"audio_data is not None: {audio_data is not None}")
+        logger.debug(f"input_text: {input_text}")
+        logger.debug("="*80)
 
         # Automatically prepend audio token if not present
         if audio_data and not self.AUDIO_TOKEN_REGEX.search(input_text):
             input_text = f"{self.AUDIO_TOKEN}{input_text}"
-            sys.stderr.write(f"[PROCESSOR DEBUG] Auto-prepended audio token\n")
-            sys.stderr.flush()
+            logger.debug("Auto-prepended audio token")
 
         base_output = self.load_mm_data(
             prompt=input_text,
@@ -108,27 +108,25 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             multimodal_tokens=self.mm_tokens,
         )
         if base_output is None:
-            sys.stderr.write("[PROCESSOR DEBUG] base_output is None\n")
-            sys.stderr.flush()
+            logger.debug("base_output is None")
             return None
 
         mm_items, input_ids, ret = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
-        sys.stderr.write(f"[PROCESSOR DEBUG] mm_items count: {len(mm_items)}\n")
-        sys.stderr.write(f"[PROCESSOR DEBUG] ret keys: {list(ret.keys())}\n")
-        sys.stderr.write(f"[PROCESSOR DEBUG] input_ids shape: {input_ids.shape}\n")
-        sys.stderr.write(f"[PROCESSOR DEBUG] input_ids: {input_ids.tolist()}\n")
-        sys.stderr.write(f"[PROCESSOR DEBUG] audio_token_id={self.audio_token_id}, audio_start_id={self.audio_start_id}, audio_end_id={self.audio_end_id}\n")
-        sys.stderr.write(f"[PROCESSOR DEBUG] Count of audio_token_id in input_ids: {(input_ids == self.audio_token_id).sum().item()}\n")
+        logger.debug(f"mm_items count: {len(mm_items)}")
+        logger.debug(f"ret keys: {list(ret.keys())}")
+        logger.debug(f"input_ids shape: {input_ids.shape}")
+        logger.debug(f"input_ids: {input_ids.tolist()}")
+        logger.debug(f"audio_token_id={self.audio_token_id}, audio_start_id={self.audio_start_id}, audio_end_id={self.audio_end_id}")
+        logger.debug(f"Count of audio_token_id in input_ids: {(input_ids == self.audio_token_id).sum().item()}")
         for i, item in enumerate(mm_items):
-            sys.stderr.write(f"[PROCESSOR DEBUG] mm_item[{i}] modality: {item.modality}\n")
-            sys.stderr.write(f"[PROCESSOR DEBUG] mm_item[{i}] pad_value: {getattr(item, 'pad_value', 'NOT SET')}\n")
-            sys.stderr.write(f"[PROCESSOR DEBUG] mm_item[{i}] offsets: {getattr(item, 'offsets', 'NOT SET')}\n")
-            sys.stderr.write(f"[PROCESSOR DEBUG] mm_item[{i}] has feature: {hasattr(item, 'feature')}\n")
+            logger.debug(f"mm_item[{i}] modality: {item.modality}")
+            logger.debug(f"mm_item[{i}] pad_value: {getattr(item, 'pad_value', 'NOT SET')}")
+            logger.debug(f"mm_item[{i}] offsets: {getattr(item, 'offsets', 'NOT SET')}")
+            logger.debug(f"mm_item[{i}] has feature: {hasattr(item, 'feature')}")
             if hasattr(item, 'feature') and item.feature is not None:
-                sys.stderr.write(f"[PROCESSOR DEBUG] mm_item[{i}] feature shape: {item.feature.shape}\n")
-        sys.stderr.flush()
+                logger.debug(f"mm_item[{i}] feature shape: {item.feature.shape}")
 
         # MiDashengLM processor returns audio_length from feature_extractor
         # This is the mel-spectrogram frame count, NOT the waveform length
@@ -139,15 +137,13 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             if isinstance(audio_length, torch.Tensor):
                 audio_length = audio_length.item() if audio_length.numel() == 1 else audio_length[0].item()
             mm_items[0].audio_length = audio_length
-            sys.stderr.write(f"[PROCESSOR DEBUG] Set audio_length={audio_length} (from processor, mel frame count)\n")
-            sys.stderr.flush()
+            logger.debug(f"Set audio_length={audio_length} (from processor, mel frame count)")
         elif "input_values" in ret and len(mm_items) > 0:
             # Fallback: use waveform length if audio_length not provided
             input_values = ret["input_values"]
             audio_length = input_values.shape[-1] if input_values.ndim >= 2 else input_values.shape[0]
             mm_items[0].audio_length = audio_length
-            sys.stderr.write(f"[PROCESSOR DEBUG] Set audio_length={audio_length} (fallback, waveform length)\n")
-            sys.stderr.flush()
+            logger.debug(f"Set audio_length={audio_length} (fallback, waveform length)")
 
         result = {
             "mm_items": mm_items,
@@ -156,6 +152,5 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             "audio_token_id": self.audio_token_id,
             "audio_end_id": self.audio_end_id,
         }
-        sys.stderr.write(f"[PROCESSOR DEBUG] Returning {len(result['mm_items'])} mm_items\n\n")
-        sys.stderr.flush()
+        logger.debug(f"Returning {len(result['mm_items'])} mm_items")
         return result

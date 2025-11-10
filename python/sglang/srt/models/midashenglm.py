@@ -26,6 +26,7 @@
 
 import collections
 import collections.abc
+import logging
 from collections.abc import Callable, Sequence
 from typing import Iterable, List, Optional, Tuple, TypeAlias, cast
 
@@ -34,6 +35,8 @@ import torch
 import torch.nn as nn
 import torchaudio.functional as F
 from transformers import PretrainedConfig
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import (
@@ -577,20 +580,17 @@ class MiDashengLMModel(nn.Module):
         Returns:
             audio_embeddings: Concatenated audio embeddings
         """
-        import sys
-        sys.stderr.write("\n" + "="*80 + "\n")
-        sys.stderr.write(f"[MODEL DEBUG] get_audio_feature called with {len(items)} items\n")
-        sys.stderr.write("="*80 + "\n")
+        logger.debug("="*80)
+        logger.debug(f"get_audio_feature called with {len(items)} items")
+        logger.debug("="*80)
         for i, item in enumerate(items):
-            sys.stderr.write(f"[MODEL DEBUG] Item {i} feature shape: {item.feature.shape}\n")
-            sys.stderr.write(f"[MODEL DEBUG] Item {i} audio_length: {getattr(item, 'audio_length', 'NOT SET')}\n")
-            sys.stderr.write(f"[MODEL DEBUG] Item {i} pad_value: {getattr(item, 'pad_value', 'NOT SET')}\n")
-            sys.stderr.write(f"[MODEL DEBUG] Item {i} hash: {getattr(item, 'hash', 'NOT SET')}\n")
-        sys.stderr.flush()
+            logger.debug(f"Item {i} feature shape: {item.feature.shape}")
+            logger.debug(f"Item {i} audio_length: {getattr(item, 'audio_length', 'NOT SET')}")
+            logger.debug(f"Item {i} pad_value: {getattr(item, 'pad_value', 'NOT SET')}")
+            logger.debug(f"Item {i} hash: {getattr(item, 'hash', 'NOT SET')}")
 
         input_values = torch.cat([item.feature for item in items], dim=0)
-        sys.stderr.write(f"[MODEL DEBUG] Concatenated input_values shape: {input_values.shape}\n")
-        sys.stderr.flush()
+        logger.debug(f"Concatenated input_values shape: {input_values.shape}")
 
         # Get audio lengths if available
         audio_lengths = []
@@ -602,35 +602,30 @@ class MiDashengLMModel(nn.Module):
                 audio_lengths.append(item.feature.shape[-1])
 
         audio_length = torch.tensor(audio_lengths, device=input_values.device)
-        sys.stderr.write(f"[MODEL DEBUG] audio_length: {audio_length}\n")
-        sys.stderr.flush()
+        logger.debug(f"audio_length: {audio_length}")
 
         # Process through encoder and projector
         encoder_out, encoder_atts = self.audio_encoder(input_values, audio_length)
-        sys.stderr.write(f"[MODEL DEBUG] Encoder output shape: {encoder_out.shape}\n")
-        sys.stderr.flush()
+        logger.debug(f"Encoder output shape: {encoder_out.shape}")
 
         audio_embeddings, _ = self.audio_projector(encoder_out, encoder_atts)
         audio_embeddings = audio_embeddings.to(input_values.dtype)
-        sys.stderr.write(f"[MODEL DEBUG] Projector output shape: {audio_embeddings.shape}\n")
-        sys.stderr.flush()
+        logger.debug(f"Projector output shape: {audio_embeddings.shape}")
 
         batch_size, max_audio_tokens, embed_dim = audio_embeddings.shape
 
         # Use the actual output from projector instead of calculating
         # This ensures we don't miss or incorrectly truncate audio features
-        sys.stderr.write(f"[MODEL DEBUG] Using all {max_audio_tokens} audio tokens from projector output\n")
-        sys.stderr.flush()
+        logger.debug(f"Using all {max_audio_tokens} audio tokens from projector output")
 
         # Simply reshape to flatten batch dimension
         # All tokens from projector output are valid
         masked_audio_features = audio_embeddings.reshape(-1, embed_dim)
-        sys.stderr.write(f"[MODEL DEBUG] Final output shape: {masked_audio_features.shape}\n")
-        sys.stderr.write(f"[MODEL DEBUG] Stats: min={masked_audio_features.min().item():.4f}, max={masked_audio_features.max().item():.4f}\n")
-        sys.stderr.write(f"[MODEL DEBUG] Audio embeddings dtype: {masked_audio_features.dtype}, device: {masked_audio_features.device}\n")
-        sys.stderr.write(f"[MODEL DEBUG] First 5 values of first audio token: {masked_audio_features[0, :5].tolist()}\n")
-        sys.stderr.write("="*80 + "\n\n")
-        sys.stderr.flush()
+        logger.debug(f"Final output shape: {masked_audio_features.shape}")
+        logger.debug(f"Stats: min={masked_audio_features.min().item():.4f}, max={masked_audio_features.max().item():.4f}")
+        logger.debug(f"Audio embeddings dtype: {masked_audio_features.dtype}, device: {masked_audio_features.device}")
+        logger.debug(f"First 5 values of first audio token: {masked_audio_features[0, :5].tolist()}")
+        logger.debug("="*80)
 
         # Return concatenated audio embeddings (all valid audio tokens in sequence)
         return masked_audio_features
@@ -654,23 +649,21 @@ class MiDashengLMModel(nn.Module):
             forward_batch: Forward batch information including multimodal data.
         """
         # Debug: Check if input_ids has been padded with pad_value
-        import sys
         if forward_batch.contains_mm_inputs():
-            sys.stderr.write("\n" + "="*80 + "\n")
-            sys.stderr.write(f"[FORWARD DEBUG] input_ids shape: {input_ids.shape}\n")
-            sys.stderr.write(f"[FORWARD DEBUG] input_ids first 20: {input_ids[:20].tolist()}\n")
-            sys.stderr.write(f"[FORWARD DEBUG] input_ids unique values count: {len(torch.unique(input_ids))}\n")
+            logger.debug("="*80)
+            logger.debug(f"input_ids shape: {input_ids.shape}")
+            logger.debug(f"input_ids first 20: {input_ids[:20].tolist()}")
+            logger.debug(f"input_ids unique values count: {len(torch.unique(input_ids))}")
             if forward_batch.mm_inputs and len(forward_batch.mm_inputs) > 0:
                 mm_input = forward_batch.mm_inputs[0]
                 if mm_input and len(mm_input.mm_items) > 0:
                     pad_value = mm_input.mm_items[0].pad_value
-                    sys.stderr.write(f"[FORWARD DEBUG] Expected pad_value: {pad_value}\n")
-                    sys.stderr.write(f"[FORWARD DEBUG] Count of pad_value in input_ids: {(input_ids == pad_value).sum().item()}\n")
+                    logger.debug(f"Expected pad_value: {pad_value}")
+                    logger.debug(f"Count of pad_value in input_ids: {(input_ids == pad_value).sum().item()}")
                     if hasattr(mm_input, 'audio_token_id') and mm_input.audio_token_id:
-                        sys.stderr.write(f"[FORWARD DEBUG] audio_token_id: {mm_input.audio_token_id}\n")
-                        sys.stderr.write(f"[FORWARD DEBUG] Count of audio_token_id in input_ids: {(input_ids == mm_input.audio_token_id).sum().item()}\n")
-            sys.stderr.write("="*80 + "\n\n")
-            sys.stderr.flush()
+                        logger.debug(f"audio_token_id: {mm_input.audio_token_id}")
+                        logger.debug(f"Count of audio_token_id in input_ids: {(input_ids == mm_input.audio_token_id).sum().item()}")
+            logger.debug("="*80)
 
         # Process multimodal inputs through language model (matches Qwen2Audio pattern)
         return general_mm_embed_routine(
@@ -683,8 +676,6 @@ class MiDashengLMModel(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load model weights."""
-        import sys
-
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         # Also include buffers (for mel_scale, spectrogram window, etc.)
         buffers_dict = dict(self.named_buffers())
@@ -757,8 +748,7 @@ class MiDashengLMModel(nn.Module):
         # Pass decoder weights to language_model.load_weights()
         # Strip "decoder." prefix since language_model expects weights without it
         if decoder_weights:
-            sys.stderr.write(f"\n[WEIGHT LOADING] Passing {len(decoder_weights)} decoder weights to language_model.load_weights()\n")
-            sys.stderr.flush()
+            logger.info(f"Passing {len(decoder_weights)} decoder weights to language_model.load_weights()")
             # Remove "decoder." prefix from weight names
             decoder_weights_stripped = [
                 (name.replace("decoder.", "", 1), weight)
@@ -767,31 +757,30 @@ class MiDashengLMModel(nn.Module):
             self.language_model.load_weights(decoder_weights_stripped)
 
         # Print summary
-        sys.stderr.write(f"\n{'='*80}\n")
-        sys.stderr.write(f"[WEIGHT LOADING] Audio encoder weights loaded: {len(audio_encoder_loaded)}\n")
-        sys.stderr.write(f"[WEIGHT LOADING] Audio projector weights loaded: {len(audio_projector_loaded)}\n")
-        sys.stderr.write(f"[WEIGHT LOADING] Decoder weights passed to language_model: {len(decoder_weights)}\n")
-        sys.stderr.write(f"[WEIGHT LOADING] Skipped weights: {len(skipped_weights)}\n")
+        logger.info("="*80)
+        logger.info(f"Audio encoder weights loaded: {len(audio_encoder_loaded)}")
+        logger.info(f"Audio projector weights loaded: {len(audio_projector_loaded)}")
+        logger.info(f"Decoder weights passed to language_model: {len(decoder_weights)}")
+        logger.info(f"Skipped weights: {len(skipped_weights)}")
 
         # Analyze skipped weights
         encoder_skipped = [s for s in skipped_weights if 'audio_encoder' in s]
         projector_skipped = [s for s in skipped_weights if 'audio_projector' in s]
 
         if projector_skipped:
-            sys.stderr.write(f"[WEIGHT LOADING] Skipped audio_projector weights:\n")
+            logger.info("Skipped audio_projector weights:")
             for s in projector_skipped:
-                sys.stderr.write(f"  {s}\n")
+                logger.info(f"  {s}")
 
         if encoder_skipped:
-            sys.stderr.write(f"[WEIGHT LOADING] Skipped audio_encoder weights: {len(encoder_skipped)}\n")
+            logger.info(f"Skipped audio_encoder weights: {len(encoder_skipped)}")
             non_bias_skipped = [s for s in encoder_skipped if 'bias' not in s]
             if non_bias_skipped:
-                sys.stderr.write(f"  First 10 non-bias skipped:\n")
+                logger.info("  First 10 non-bias skipped:")
                 for s in non_bias_skipped[:10]:
-                    sys.stderr.write(f"    {s}\n")
+                    logger.info(f"    {s}")
 
-        sys.stderr.write(f"{'='*80}\n\n")
-        sys.stderr.flush()
+        logger.info("="*80)
 
     def get_embed_and_head(self):
         return self.language_model.model.embed_tokens.weight, self.language_model.lm_head.weight
