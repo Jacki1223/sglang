@@ -687,12 +687,8 @@ class MiDashengLMModel(nn.Module):
         import re
         from collections import defaultdict
 
-        # Convert to list to enable multiple passes and counting
-        weights_list = list(weights)
-
         sys.stderr.write(f"\n{'='*80}\n")
         sys.stderr.write(f"[WEIGHT LOADING] Starting weight loading for MiDashengLM\n")
-        sys.stderr.write(f"[WEIGHT LOADING] Total weights received from iterator: {len(weights_list)}\n")
         sys.stderr.write(f"{'='*80}\n\n")
         sys.stderr.flush()
 
@@ -704,8 +700,11 @@ class MiDashengLMModel(nn.Module):
         audio_projector_loaded = []
         skipped_weights = []
         decoder_weights = []  # Collect decoder weights to pass to language_model
+        total_weights_processed = 0  # Count weights as we process them
 
-        for name, loaded_weight in weights_list:
+        for name, loaded_weight in weights:
+            total_weights_processed += 1  # Count all weights including skipped ones
+
             if "rotary_emb.inv_freq" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
@@ -843,6 +842,7 @@ class MiDashengLMModel(nn.Module):
 
         # Print summary
         sys.stderr.write(f"\n{'='*80}\n")
+        sys.stderr.write(f"[WEIGHT LOADING] Total weights processed: {total_weights_processed}\n")
         sys.stderr.write(f"[WEIGHT LOADING] Audio encoder weights loaded: {len(audio_encoder_loaded)}\n")
         sys.stderr.write(f"[WEIGHT LOADING] Audio projector weights loaded: {len(audio_projector_loaded)}\n")
         sys.stderr.write(f"[WEIGHT LOADING] Decoder weights passed to language_model: {len(decoder_weights)}\n")
