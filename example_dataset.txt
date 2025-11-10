@@ -1,0 +1,6 @@
+# MiDashengLM 示例数据集
+# 格式：音频URL,中文描述
+# 每行一个样本，用逗号分隔
+
+https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/audios/Trump_WEF_2018_10s.mp3,特朗普在世界经济论坛上的演讲片段
+https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/audios/bird_song.mp3,鸟鸣声音
