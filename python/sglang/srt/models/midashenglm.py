@@ -464,7 +464,7 @@ class AudioProjectorSubsample(nn.Module):
         self.fc1 = ColumnParallelLinear(
             input_size=in_dim * self.k,
             output_size=out_dim,
-            bias=False,
+            bias=True,
             quant_config=quant_config,
             prefix=add_prefix("net.0", prefix),
         )
@@ -472,7 +472,7 @@ class AudioProjectorSubsample(nn.Module):
         self.fc2 = RowParallelLinear(
             input_size=out_dim,
             output_size=out_dim,
-            bias=False,
+            bias=True,
             quant_config=quant_config,
             prefix=add_prefix("net.2", prefix),
         )
