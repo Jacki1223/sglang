@@ -632,6 +632,8 @@ def safetensors_weights_iterator(
         desc="Loading safetensors checkpoint shards",
         disable=not enable_tqdm,
         bar_format=_BAR_FORMAT,
+        mininterval=0,  # Force update every iteration
+        miniters=1,     # Update for every file
     ):
         if disable_mmap:
             with open(st_file, "rb") as f:
@@ -894,6 +896,8 @@ def runai_safetensors_weights_iterator(
             desc="Loading safetensors using Runai Model Streamer",
             disable=not enable_tqdm,
             bar_format=_BAR_FORMAT,
+            mininterval=0,  # Force update every iteration
+            miniters=1,     # Update for every file
         ):
             streamer.stream_file(st_file)
             yield from streamer.get_tensors()
