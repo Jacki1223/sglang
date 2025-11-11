@@ -1648,6 +1648,7 @@ def sample_audio_requests(
         audio_hash = hashlib.md5(row.audio_data[0][:200].encode()).hexdigest()[:8]
         print(f"  Sample {i}: prompt='{row.prompt[:50]}...' audio_data_len={len(row.audio_data)} audio_hash={audio_hash}")
 
+    print(f"[TRACE] sample_audio_requests returning {len(dataset)} samples (requested: {num_requests})")
     return dataset
 
 
@@ -1929,6 +1930,7 @@ async def benchmark(
     profile_prefill_url: Optional[List[str]] = None,
     profile_decode_url: Optional[List[str]] = None,
 ):
+    print(f"[TRACE] benchmark() received {len(input_requests)} input_requests")
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
@@ -2104,7 +2106,9 @@ async def benchmark(
                 limited_request_func(request_func_input=request_func_input, pbar=pbar)
             )
         )
+    print(f"[TRACE] Created {len(tasks)} tasks, now gathering results...")
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+    print(f"[TRACE] Gathered {len(outputs)} outputs")
 
     # Stop profiler
     if profile:
@@ -2307,6 +2311,7 @@ async def benchmark(
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
+    print(f"[TRACE] result_details created with {len(result_details['generated_texts'])} generated_texts")
 
     # Append results to a JSONL file
     with open(output_file_name, "a") as file:
