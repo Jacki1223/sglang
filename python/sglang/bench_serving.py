@@ -367,6 +367,27 @@ async def async_request_openai_chat_completions(
 
         headers = get_auth_headers()
 
+        # Debug logging for audio requests
+        if request_func_input.audio_data and args.dataset_name == "audio":
+            import hashlib
+            debug_info = {
+                "prompt_preview": request_func_input.prompt[:80],
+                "audio_data_count": len(request_func_input.audio_data),
+                "audio_hashes": []
+            }
+            for i, audio_url in enumerate(request_func_input.audio_data):
+                h = hashlib.md5(audio_url[:200].encode()).hexdigest()[:8]
+                debug_info["audio_hashes"].append(f"{i}:{h}")
+
+            if isinstance(messages[0].get("content"), list):
+                content_items = messages[0]["content"]
+                debug_info["content_items"] = {
+                    "audio": len([x for x in content_items if x.get("type") == "audio_url"]),
+                    "text": len([x for x in content_items if x.get("type") == "text"]),
+                    "total": len(content_items)
+                }
+            print(f"[DEBUG_AUDIO_REQUEST] {json.dumps(debug_info)}")
+
         output = RequestFuncOutput.init_new(request_func_input)
 
         generated_text = ""
@@ -1619,6 +1640,13 @@ def sample_audio_requests(
     print(f"#Input tokens: {np.sum([x.prompt_len for x in dataset])}")
     print(f"#Output tokens: {np.sum([x.output_len for x in dataset])}")
     print(f"\nLoaded {len(dataset)} audio samples with average {total_audio_bytes // len(dataset) if dataset else 0} bytes per audio")
+
+    # Debug: Show details of each loaded audio
+    print("\n[DEBUG_AUDIO_DATASET] Loaded audio samples:")
+    for i, row in enumerate(dataset, 1):
+        import hashlib
+        audio_hash = hashlib.md5(row.audio_data[0][:200].encode()).hexdigest()[:8]
+        print(f"  Sample {i}: prompt='{row.prompt[:50]}...' audio_data_len={len(row.audio_data)} audio_hash={audio_hash}")
 
     return dataset
 
