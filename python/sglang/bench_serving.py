@@ -2329,9 +2329,6 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "mooncake_slowdown_factor"):
         args.mooncake_slowdown_factor = 1.0
 
-    if not hasattr(args, "mooncake_slowdown_factor"):
-        args.mooncake_slowdown_factor = 1.0
-
     if not hasattr(args, "mooncake_num_rounds"):
         args.mooncake_num_rounds = 1
 
