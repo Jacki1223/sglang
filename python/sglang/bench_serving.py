@@ -386,7 +386,20 @@ async def async_request_openai_chat_completions(
                     "text": len([x for x in content_items if x.get("type") == "text"]),
                     "total": len(content_items)
                 }
+
+            # Print complete payload (without full audio data)
+            debug_payload = {
+                "temperature": payload.get("temperature"),
+                "max_completion_tokens": payload.get("max_completion_tokens"),
+                "stream": payload.get("stream"),
+                "ignore_eos": payload.get("ignore_eos"),
+                "extra_params": list(request_func_input.extra_request_body.keys()) if request_func_input.extra_request_body else []
+            }
+            debug_info["payload"] = debug_payload
+
             print(f"[DEBUG_AUDIO_REQUEST] {json.dumps(debug_info)}")
+            print(f"[DEBUG_PAYLOAD] Full params: temperature={payload.get('temperature')}, ignore_eos={payload.get('ignore_eos')}, stream={payload.get('stream')}")
+
 
         output = RequestFuncOutput.init_new(request_func_input)
 
