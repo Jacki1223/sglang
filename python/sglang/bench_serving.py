@@ -78,6 +78,7 @@ class RequestFuncInput:
     model: str
     lora_name: str
     image_data: Optional[List[str]]
+    audio_data: Optional[List[str]]
     extra_request_body: Dict[str, Any]
     timestamp: Optional[float] = None
 
@@ -222,6 +223,9 @@ async def async_request_openai_completions(
         if request_func_input.image_data:
             payload.update({"image_data": request_func_input.image_data})
 
+        if request_func_input.audio_data:
+            payload.update({"audio_data": request_func_input.audio_data})
+
         headers = get_auth_headers()
 
         output = RequestFuncOutput.init_new(request_func_input)
@@ -311,15 +315,30 @@ async def async_request_openai_chat_completions(
         "chat/completions"
     ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
 
-    if request_func_input.image_data:
-        # Build multi-image content: a list of image_url entries followed by the text
-        content_items = [
-            {
-                "type": "image_url",
-                "image_url": {"url": img_url},
-            }
-            for img_url in request_func_input.image_data
-        ]
+    if request_func_input.image_data or request_func_input.audio_data:
+        # Build multimodal content: a list of image_url/audio_url entries followed by the text
+        content_items = []
+
+        # Add images if present
+        if request_func_input.image_data:
+            content_items.extend([
+                {
+                    "type": "image_url",
+                    "image_url": {"url": img_url},
+                }
+                for img_url in request_func_input.image_data
+            ])
+
+        # Add audios if present
+        if request_func_input.audio_data:
+            content_items.extend([
+                {
+                    "type": "audio_url",
+                    "audio_url": {"url": audio_url},
+                }
+                for audio_url in request_func_input.audio_data
+            ])
+
         content_items.append({"type": "text", "text": request_func_input.prompt})
         messages = [
             {
@@ -793,6 +812,14 @@ def get_dataset(args, tokenizer, model_id=None):
             fixed_output_len=args.random_output_len,
             random_sample=True,
         )
+    elif args.dataset_name == "audio":
+        processor = get_processor(model_id)
+        input_requests = sample_audio_requests(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            processor=processor,
+            fixed_output_len=args.random_output_len,
+        )
     elif args.dataset_name == "mooncake":
         # For mooncake, we don't generate the prompts here.
         # We just load the raw trace data. The async generator will handle the rest.
@@ -933,6 +960,7 @@ class DatasetRow:
     text_prompt_len: Optional[int] = None
     vision_prompt_len: Optional[int] = None
     image_data: Optional[List[str]] = None
+    audio_data: Optional[List[str]] = None
     timestamp: Optional[float] = None
 
     def __post_init__(self):
@@ -1488,6 +1516,113 @@ def sample_image_requests(
     return dataset
 
 
+def sample_audio_requests(
+    dataset_path: str,
+    num_requests: int,
+    processor: AutoProcessor,
+    fixed_output_len: Optional[int] = None,
+) -> List[DatasetRow]:
+    """Sample audio requests from a JSON file.
+
+    Args:
+        dataset_path: Path to JSON file with format [{"prompt": "...", "audio_path": "..."}, ...]
+        num_requests: Number of requests to sample
+        processor: AutoProcessor for tokenization
+        fixed_output_len: Fixed output length for all requests (if None, use random)
+
+    Returns:
+        List of DatasetRow objects with audio data
+    """
+    import librosa
+
+    # Load dataset from JSON file
+    with open(dataset_path, "r") as f:
+        dataset_json = [json.loads(line) for line in f]
+
+    # Sample requests
+    if num_requests > len(dataset_json):
+        print(f"Warning: Requested {num_requests} samples but only {len(dataset_json)} available. Using all samples.")
+        sampled_data = dataset_json
+    else:
+        sampled_data = random.sample(dataset_json, num_requests)
+
+    dataset: List[DatasetRow] = []
+    total_audio_bytes = 0
+
+    for item in sampled_data:
+        prompt = item["prompt"]
+        audio_path = item["audio_path"]
+
+        # Load and encode audio file
+        try:
+            # Load audio file using librosa (supports various formats)
+            audio_array, sample_rate = librosa.load(audio_path, sr=16000, mono=True)
+
+            # Convert to bytes and base64 encode
+            # Save as WAV format in memory
+            import wave
+            import struct
+
+            buffer = io.BytesIO()
+            with wave.open(buffer, 'wb') as wav_file:
+                wav_file.setnchannels(1)  # mono
+                wav_file.setsampwidth(2)  # 16-bit
+                wav_file.setframerate(16000)
+                # Convert float32 audio to int16
+                audio_int16 = (audio_array * 32767).astype(np.int16)
+                wav_file.writeframes(audio_int16.tobytes())
+
+            buffer.seek(0)
+            audio_bytes = buffer.read()
+            encoded = pybase64.b64encode(audio_bytes).decode("utf-8")
+            audio_data_uri = f"data:audio/wav;base64,{encoded}"
+            total_audio_bytes += len(audio_bytes)
+
+        except Exception as e:
+            print(f"Error loading audio file {audio_path}: {e}")
+            continue
+
+        # Tokenize prompt to get text token count
+        tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        text_prompt_len = len(tokenizer.encode(prompt))
+
+        # For audio models, we need to estimate the total token count including audio
+        # MiDashengLM uses special audio tokens: <|audio_bos|><|AUDIO|><|audio_eos|>
+        # The actual audio token count depends on the audio length and subsampling
+        # We'll calculate this based on the audio duration
+        audio_duration = len(audio_array) / 16000  # duration in seconds
+        # Rough estimate: MiDashengLM processes audio with multiple subsampling stages
+        # After mel-spectrogram, patch embedding, transformer, and projector subsampling
+        # Approximate: 16000 samples/sec, hop_length=160, so ~100 frames/sec
+        # After 5x subsampling in projector: ~20 tokens/sec of audio
+        audio_token_count = int(audio_duration * 20)
+
+        # Total prompt length = text tokens + audio tokens + special tokens
+        prompt_len = text_prompt_len + audio_token_count + 3  # +3 for special tokens
+
+        # Determine output length
+        if fixed_output_len is not None:
+            output_len = fixed_output_len
+        else:
+            # Use a default or extract from dataset if available
+            output_len = item.get("output_len", 256)
+
+        dataset.append(DatasetRow(
+            prompt=prompt,
+            prompt_len=prompt_len,
+            output_len=output_len,
+            text_prompt_len=text_prompt_len,
+            vision_prompt_len=audio_token_count,  # Store audio token count here
+            audio_data=[audio_data_uri],
+        ))
+
+    print(f"#Input tokens: {np.sum([x.prompt_len for x in dataset])}")
+    print(f"#Output tokens: {np.sum([x.output_len for x in dataset])}")
+    print(f"\nLoaded {len(dataset)} audio samples with average {total_audio_bytes // len(dataset) if dataset else 0} bytes per audio")
+
+    return dataset
+
+
 @lru_cache(maxsize=1)
 def get_available_tokens(tokenizer):
     """Get all available token ids from the tokenizer vocabulary."""
@@ -1825,6 +1960,7 @@ async def benchmark(
         output_len=min(test_request.output_len, 32),
         lora_name=lora_name,
         image_data=test_request.image_data,
+        audio_data=test_request.audio_data,
         extra_request_body=extra_request_body,
     )
 
@@ -1930,6 +2066,7 @@ async def benchmark(
             output_len=request.output_len,
             lora_name=lora_name,
             image_data=request.image_data,
+            audio_data=request.audio_data,
             extra_request_body=extra_request_body,
             timestamp=request.timestamp,
         )
@@ -2423,6 +2560,7 @@ if __name__ == "__main__":
             "generated-shared-prefix",
             "mmmu",
             "image",
+            "audio",
             "mooncake",
         ],
         help="Name of the dataset to benchmark on.",
