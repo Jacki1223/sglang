@@ -397,8 +397,25 @@ async def async_request_openai_chat_completions(
             }
             debug_info["payload"] = debug_payload
 
+            # Print messages structure
+            debug_messages = []
+            for msg in messages:
+                if isinstance(msg.get("content"), list):
+                    content_summary = []
+                    for item in msg["content"]:
+                        if item.get("type") == "audio_url":
+                            content_summary.append({"type": "audio_url", "url_preview": item["audio_url"]["url"][:50]+"..."})
+                        elif item.get("type") == "text":
+                            content_summary.append({"type": "text", "text_preview": item["text"][:50]+"..."})
+                        else:
+                            content_summary.append(item)
+                    debug_messages.append({"role": msg["role"], "content": content_summary})
+                else:
+                    debug_messages.append({"role": msg["role"], "content": str(msg.get("content"))[:50]+"..."})
+
             print(f"[DEBUG_AUDIO_REQUEST] {json.dumps(debug_info)}")
             print(f"[DEBUG_PAYLOAD] Full params: temperature={payload.get('temperature')}, ignore_eos={payload.get('ignore_eos')}, stream={payload.get('stream')}")
+            print(f"[DEBUG_MESSAGES] {json.dumps(debug_messages, ensure_ascii=False)}")
 
 
         output = RequestFuncOutput.init_new(request_func_input)
