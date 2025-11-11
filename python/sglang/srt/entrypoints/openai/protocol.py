@@ -269,6 +269,11 @@ class CompletionRequest(BaseModel):
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
 
+    # Multimodal support
+    image_data: Optional[List[str]] = None
+    audio_data: Optional[List[str]] = None
+    video_data: Optional[List[str]] = None
+
     @field_validator("max_tokens")
     @classmethod
     def validate_max_tokens_positive(cls, v):

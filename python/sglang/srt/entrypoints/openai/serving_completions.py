@@ -106,6 +106,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
+            image_data=request.image_data,
+            audio_data=request.audio_data,
+            video_data=request.video_data,
             sampling_params=sampling_params,
             return_logprob=request.logprobs is not None,
             top_logprobs_num=request.logprobs if request.logprobs is not None else 0,
