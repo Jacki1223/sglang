@@ -73,6 +73,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
         if self.template_manager.completion_template_name is not None:
             prompt = generate_completion_prompt_from_request(request)
 
+        # Handle multimodal requests (audio/image/video)
+        # For multimodal models, audio_data should be processed through the model's processor
+        # The processor will handle tokenization and embedding
+        is_multimodal = (
+            request.audio_data or request.image_data or request.video_data
+        )
+
         # Set logprob start length based on echo and logprobs
         if request.echo and request.logprobs:
             logprob_start_len = 0
@@ -83,7 +90,17 @@ class OpenAIServingCompletion(OpenAIServingBase):
         sampling_params = self._build_sampling_params(request)
 
         # Determine prompt format
-        if isinstance(prompt, str) or (
+        if is_multimodal:
+            # For multimodal requests, use text + data URLs
+            # The multimodal processor will handle the actual processing
+            if not isinstance(prompt, str):
+                # Convert to string if it's token ids
+                prompt = self.tokenizer_manager.tokenizer.decode(
+                    prompt if isinstance(prompt, list) and isinstance(prompt[0], int)
+                    else prompt[0] if isinstance(prompt, list) else prompt
+                )
+            prompt_kwargs = {"text": prompt}
+        elif isinstance(prompt, str) or (
             isinstance(prompt, list) and isinstance(prompt[0], str)
         ):
             prompt_kwargs = {"text": prompt}
@@ -103,6 +120,18 @@ class OpenAIServingCompletion(OpenAIServingBase):
             )
             if first_adapter:
                 self._validate_lora_enabled(first_adapter)
+
+        # Debug multimodal requests
+        if is_multimodal:
+            logger.info(f"[COMPLETIONS API] Multimodal request detected:")
+            logger.info(f"  - prompt: {prompt[:100] if isinstance(prompt, str) else '<token_ids>'}...")
+            if request.audio_data:
+                logger.info(f"  - audio_data count: {len(request.audio_data)}")
+                logger.info(f"  - audio_data[0] preview: {request.audio_data[0][:50]}...")
+            if request.image_data:
+                logger.info(f"  - image_data count: {len(request.image_data)}")
+            if request.video_data:
+                logger.info(f"  - video_data count: {len(request.video_data)}")
 
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
