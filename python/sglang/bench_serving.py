@@ -225,6 +225,9 @@ async def async_request_openai_completions(
 
         if request_func_input.audio_data:
             payload.update({"audio_data": request_func_input.audio_data})
+            print(f"[DEBUG_COMPLETIONS_API] Added audio_data to payload: {len(request_func_input.audio_data)} items, first item length: {len(request_func_input.audio_data[0])}")
+        else:
+            print(f"[DEBUG_COMPLETIONS_API] No audio_data in request_func_input! audio_data={request_func_input.audio_data}")
 
         headers = get_auth_headers()
 
@@ -2124,6 +2127,12 @@ async def benchmark(
                 lora_name = np.random.choice(lora_names, p=lora_probs)
         else:
             lora_name = None
+
+        # Debug: Check if request has audio_data
+        if request.audio_data:
+            print(f"[DEBUG_BENCHMARK] Request has audio_data: {len(request.audio_data)} items")
+        else:
+            print(f"[DEBUG_BENCHMARK] Request audio_data is None or empty: {request.audio_data}")
 
         request_func_input = RequestFuncInput(
             model=model_id,
