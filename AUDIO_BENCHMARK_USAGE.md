@@ -20,13 +20,23 @@
 使用提供的包装脚本，它会自动设置正确的Python路径：
 
 ```bash
-# 使用包装脚本运行
+# 基础运行（只显示性能指标）
 /home/user/sglang/run_bench_serving_audio.sh \
     --backend sglang-oai-chat \
     --dataset-name audio \
     --dataset-path /tmp/audio_benchmark_test/audio_dataset.jsonl \
     --num-prompts 3 \
     --port 30000
+
+# 保存推理结果到文件
+/home/user/sglang/run_bench_serving_audio.sh \
+    --backend sglang-oai-chat \
+    --dataset-name audio \
+    --dataset-path /tmp/audio_benchmark_test/audio_dataset.jsonl \
+    --num-prompts 3 \
+    --port 30000 \
+    --output-file results.jsonl \
+    --output-details
 ```
 
 ### 方法2：手动设置PYTHONPATH
@@ -106,6 +116,104 @@ python3 /tmp/diagnose_dataset.py /path/to/your/audio_dataset.jsonl
     --dataset-path /tmp/audio_benchmark_test/audio_dataset.jsonl \
     --num-prompts 3
 ```
+
+## 查看推理结果 ⭐
+
+bench_serving默认只显示性能指标，但可以保存完整的推理结果。
+
+### 保存推理结果
+
+添加 `--output-file` 和 `--output-details` 参数：
+
+```bash
+/home/user/sglang/run_bench_serving_audio.sh \
+    --backend sglang-oai-chat \
+    --dataset-name audio \
+    --dataset-path /tmp/audio_benchmark_test/audio_dataset.jsonl \
+    --num-prompts 3 \
+    --output-file results.jsonl \
+    --output-details
+```
+
+### 查看结果文件
+
+结果文件包含以下信息：
+- `generated_texts`: 模型生成的文本（推理结果） ✨
+- `input_lens`: 输入token长度
+- `output_lens`: 输出token长度
+- `ttfts`: 首token延迟（毫秒）
+- `itls`: token间延迟列表
+- `errors`: 错误信息（如果有）
+
+#### 方法1：使用便捷查看脚本
+
+```bash
+# 查看所有信息（推荐）
+/tmp/view_benchmark_results.sh results.jsonl
+
+# 只查看生成的文本
+/tmp/view_benchmark_results.sh results.jsonl --texts
+
+# 只查看性能指标
+/tmp/view_benchmark_results.sh results.jsonl --metrics
+
+# 只查看错误
+/tmp/view_benchmark_results.sh results.jsonl --errors
+```
+
+#### 方法2：使用jq查看
+
+```bash
+# 查看所有生成的文本
+cat results.jsonl | jq '.generated_texts[]'
+
+# 查看第一个生成的文本
+cat results.jsonl | jq '.generated_texts[0]'
+
+# 查看性能摘要和第一个结果
+cat results.jsonl | jq '{
+  requests: .total_requests,
+  throughput: .request_throughput,
+  first_text: .generated_texts[0]
+}'
+
+# 格式化显示所有文本
+cat results.jsonl | jq -r '.generated_texts[] | "====================\n" + . + "\n"'
+```
+
+#### 方法3：使用Python查看
+
+```python
+import json
+
+with open('results.jsonl', 'r') as f:
+    results = json.load(f)
+
+# 查看所有生成的文本
+for i, text in enumerate(results['generated_texts']):
+    print(f"=== Result {i+1} ===")
+    print(text)
+    print()
+
+# 查看指标
+print(f"Throughput: {results['request_throughput']:.2f} req/s")
+print(f"Mean TTFT: {results['mean_ttft_ms']:.2f} ms")
+```
+
+### 完整演示
+
+使用自动化演示脚本：
+
+```bash
+# 运行完整的测试并自动显示结果
+/tmp/audio_benchmark_demo.sh
+```
+
+这个脚本会：
+1. 运行基准测试
+2. 保存结果到带时间戳的文件
+3. 自动显示性能指标和生成的文本
+4. 提供查看详细结果的命令
 
 ## 故障排除
 
