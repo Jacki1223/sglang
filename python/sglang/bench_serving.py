@@ -1604,6 +1604,15 @@ def sample_audio_requests(
         prompt = item["prompt"]
         audio_path = item["audio_path"]
 
+        # For audio models, ensure prompt contains audio token placeholder
+        # MiDashengLM expects: <|audio_bos|><|AUDIO|><|audio_eos|>
+        # If prompt is empty or doesn't contain audio markers, prepend audio token
+        AUDIO_TOKEN = "<|audio_bos|><|AUDIO|><|audio_eos|>"
+        if not prompt or (AUDIO_TOKEN not in prompt and "<|audio" not in prompt and "<|AUDIO|>" not in prompt):
+            # Prepend audio token to prompt (or use it as the prompt if empty)
+            prompt = AUDIO_TOKEN + (prompt if prompt else "")
+            print(f"[DEBUG] Auto-added audio token to prompt: '{prompt[:80]}...'")
+
         # Load and encode audio file
         try:
             # Load audio file using librosa (supports various formats)
@@ -1633,23 +1642,21 @@ def sample_audio_requests(
             print(f"Error loading audio file {audio_path}: {e}")
             continue
 
+        # Calculate audio token count based on duration
+        # MiDashengLM processes audio: mel-spectrogram → patch → transformer → projector (5x subsample)
+        # Result: ~20 audio tokens per second
+        audio_duration = len(audio_array) / 16000  # duration in seconds
+        audio_token_count = int(audio_duration * 20)
+
         # Tokenize prompt to get text token count
+        # Note: prompt now includes audio token placeholders (<|audio_bos|><|AUDIO|><|audio_eos|>)
         tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
         text_prompt_len = len(tokenizer.encode(prompt))
 
-        # For audio models, we need to estimate the total token count including audio
-        # MiDashengLM uses special audio tokens: <|audio_bos|><|AUDIO|><|audio_eos|>
-        # The actual audio token count depends on the audio length and subsampling
-        # We'll calculate this based on the audio duration
-        audio_duration = len(audio_array) / 16000  # duration in seconds
-        # Rough estimate: MiDashengLM processes audio with multiple subsampling stages
-        # After mel-spectrogram, patch embedding, transformer, and projector subsampling
-        # Approximate: 16000 samples/sec, hop_length=160, so ~100 frames/sec
-        # After 5x subsampling in projector: ~20 tokens/sec of audio
-        audio_token_count = int(audio_duration * 20)
-
-        # Total prompt length = text tokens + audio tokens + special tokens
-        prompt_len = text_prompt_len + audio_token_count + 3  # +3 for special tokens
+        # The <|AUDIO|> token in prompt will be replaced by actual audio embeddings
+        # So we need to adjust: remove 1 (the <|AUDIO|> token) and add audio_token_count
+        # Total = text tokens (including <|audio_bos|> and <|audio_eos|>) - 1 (<|AUDIO|>) + audio_token_count
+        prompt_len = text_prompt_len - 1 + audio_token_count
 
         # Determine output length
         if fixed_output_len is not None:
