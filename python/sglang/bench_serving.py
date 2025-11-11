@@ -603,9 +603,12 @@ async def async_request_sglang_generate(
             **request_func_input.extra_request_body,
         }
 
-        # Add image data if available (list of image urls/base64)
+        # Add multimodal data if available (list of urls/base64)
         if request_func_input.image_data:
             payload["image_data"] = request_func_input.image_data
+        if request_func_input.audio_data:
+            payload["audio_data"] = request_func_input.audio_data
+            print(f"[DEBUG_SGLANG_GENERATE] Added audio_data to payload: {len(request_func_input.audio_data)} items")
 
         headers = get_auth_headers()
 
