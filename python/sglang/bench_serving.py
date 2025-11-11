@@ -1537,7 +1537,7 @@ def sample_audio_requests(
 
     # Load dataset from JSON file
     with open(dataset_path, "r") as f:
-        dataset_json = [json.loads(line) for line in f]
+        dataset_json = [json.loads(line) for line in f if line.strip()]
 
     # Sample requests
     if num_requests > len(dataset_json):
