@@ -2370,6 +2370,38 @@ async def benchmark(
             result_for_dump = result
         file.write(json.dumps(result_for_dump) + "\n")
 
+    # Also output readable text file with generated texts
+    if args.output_details and result_details['generated_texts']:
+        # Create text output file (replace .jsonl with .txt)
+        text_output_file = output_file_name.replace('.jsonl', '.txt').replace('.json', '.txt')
+        if text_output_file == output_file_name:  # No extension found
+            text_output_file = output_file_name + '.txt'
+
+        with open(text_output_file, "a", encoding="utf-8") as f:
+            f.write("=" * 80 + "\n")
+            f.write(f"Benchmark Run - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Total Requests: {len(result_details['generated_texts'])}\n")
+            f.write("=" * 80 + "\n\n")
+
+            for i, (text, input_len, output_len, ttft, error) in enumerate(zip(
+                result_details['generated_texts'],
+                result_details['input_lens'],
+                result_details['output_lens'],
+                result_details['ttfts'],
+                result_details['errors']
+            ), 1):
+                f.write(f"{'=' * 40} Result {i} {'=' * 40}\n")
+                f.write(f"Input Length: {input_len} tokens\n")
+                f.write(f"Output Length: {output_len} tokens\n")
+                f.write(f"Time to First Token: {ttft:.3f}s\n")
+                if error:
+                    f.write(f"Error: {error}\n")
+                f.write(f"\nGenerated Text:\n{'-' * 80}\n")
+                f.write(f"{text}\n")
+                f.write(f"{'-' * 80}\n\n")
+
+        print(f"Readable text output saved to: {text_output_file}")
+
     return result | result_details
 
 
