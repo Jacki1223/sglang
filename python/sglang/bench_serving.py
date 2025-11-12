@@ -1665,11 +1665,13 @@ def sample_audio_requests(
         prompt_len = text_prompt_len - 1 + audio_token_count
 
         # Determine output length
-        if fixed_output_len is not None:
+        # Priority: 1) JSONL file, 2) command line (fixed_output_len), 3) default (256)
+        if "output_len" in item:
+            output_len = item["output_len"]
+        elif fixed_output_len is not None:
             output_len = fixed_output_len
         else:
-            # Use a default or extract from dataset if available
-            output_len = item.get("output_len", 256)
+            output_len = 256
 
         dataset.append(DatasetRow(
             prompt=prompt,
