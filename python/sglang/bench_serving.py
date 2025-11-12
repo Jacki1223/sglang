@@ -224,7 +224,17 @@ async def async_request_openai_completions(
             payload.update({"image_data": request_func_input.image_data})
 
         if request_func_input.audio_data:
-            payload.update({"audio_data": request_func_input.audio_data})
+            audio_payload = {"audio_data": request_func_input.audio_data}
+            # Add repetition_penalty to reduce repetition
+            if args.repetition_penalty is not None:
+                audio_payload["repetition_penalty"] = args.repetition_penalty
+                print(f"[DEBUG_COMPLETIONS_API] Applied repetition_penalty={args.repetition_penalty}")
+            else:
+                # Auto-apply for audio requests
+                audio_payload["repetition_penalty"] = 1.05
+                print(f"[DEBUG_COMPLETIONS_API] Auto-applied repetition_penalty=1.05 for audio request")
+
+            payload.update(audio_payload)
             print(f"[DEBUG_COMPLETIONS_API] Added audio_data to payload: {len(request_func_input.audio_data)} items, first item length: {len(request_func_input.audio_data[0])}")
         else:
             print(f"[DEBUG_COMPLETIONS_API] No audio_data in request_func_input! audio_data={request_func_input.audio_data}")
@@ -589,13 +599,24 @@ async def async_request_sglang_generate(
     prompt = request_func_input.prompt
 
     async with _create_bench_client_session() as session:
+        sampling_params = {
+            "temperature": 0.0,
+            "max_new_tokens": request_func_input.output_len,
+            "ignore_eos": not args.disable_ignore_eos,
+        }
+
+        # Add repetition_penalty to reduce repetition
+        if args.repetition_penalty is not None:
+            sampling_params["repetition_penalty"] = args.repetition_penalty
+            print(f"[DEBUG_SGLANG_GENERATE] Applied repetition_penalty={args.repetition_penalty}")
+        elif request_func_input.audio_data:
+            # Auto-apply for audio requests
+            sampling_params["repetition_penalty"] = 1.05
+            print(f"[DEBUG_SGLANG_GENERATE] Auto-applied repetition_penalty=1.05 for audio request")
+
         payload = {
             ("text" if isinstance(prompt, str) else "input_ids"): prompt,
-            "sampling_params": {
-                "temperature": 0.0,
-                "max_new_tokens": request_func_input.output_len,
-                "ignore_eos": not args.disable_ignore_eos,
-            },
+            "sampling_params": sampling_params,
             "stream": not args.disable_stream,
             "lora_path": request_func_input.lora_name,
             "return_logprob": args.return_logprob,
@@ -2810,6 +2831,13 @@ if __name__ == "__main__":
         "--disable-ignore-eos",
         action="store_true",
         help="Disable ignoring EOS.",
+    )
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=None,
+        help="Repetition penalty to reduce repetitive outputs (e.g., 1.05). "
+        "Automatically set to 1.05 for audio requests if not specified.",
     )
     parser.add_argument(
         "--extra-request-body",
