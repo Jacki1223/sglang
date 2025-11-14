@@ -1,0 +1,41 @@
+# This is a patch file showing how to integrate ExpertLoadBalancer into existing MOE layer
+# Apply this to python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+
+# Add import at the top of the file:
+# from sglang.srt.layers.moe.expert_load_balancer import (
+#     create_load_balancer_from_env,
+#     ExpertLoadBalancer,
+# )
+
+# In the MOE layer class __init__ method, add:
+#
+#     def __init__(self, ...):
+#         super().__init__()
+#         # ... existing init code ...
+#
+#         # Initialize load balancer
+#         self.load_balancer = None
+#         if os.environ.get("SGLANG_MOE_ENABLE_LOAD_BALANCING", "0") == "1":
+#             from sglang.srt.distributed import (
+#                 get_tensor_model_parallel_world_size,
+#                 get_tensor_model_parallel_rank,
+#             )
+#
+#             self.load_balancer = create_load_balancer_from_env(
+#                 num_experts=self.num_experts,
+#                 topk=self.topk,
+#                 ep_size=get_tensor_model_parallel_world_size(),
+#                 ep_rank=get_tensor_model_parallel_rank(),
+#             )
+
+# In the forward method, after router/topk computation, add:
+#
+#     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+#         # ... router computation ...
+#         topk_weights, topk_ids = self.topk_layer(hidden_states, router_logits)
+#
+#         # Apply load balancing
+#         if self.load_balancer is not None:
+#             topk_ids, topk_weights = self.load_balancer.balance(topk_ids, topk_weights)
+#
+#         # ... rest of MOE forward pass ...
