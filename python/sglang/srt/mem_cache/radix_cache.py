@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.evict_policy import (
     LFUStrategy,
     LRUStrategy,
     MRUStrategy,
+    TieredLRUStrategy,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
@@ -247,6 +248,10 @@ class RadixCache(BasePrefixCache):
         elif eviction_policy.lower() == "filo":
             self.eviction_strategy: EvictionStrategy = FILOStrategy()
             self.arc_manager = None
+        elif eviction_policy.lower() == "tiered":
+            # Tiered LRU: Separate hot (frequent) and cold (infrequent) data
+            self.eviction_strategy: EvictionStrategy = TieredLRUStrategy(hot_threshold=2)
+            self.arc_manager = None
         elif eviction_policy.lower() == "arc":
             # ARC requires knowing the cache size
             # We'll use a reasonable default based on the token pool size
@@ -259,7 +264,7 @@ class RadixCache(BasePrefixCache):
             self.eviction_strategy: EvictionStrategy = ARCStrategy(self.arc_manager)
         else:
             raise ValueError(
-                f"Unknown eviction policy: {eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'arc'."
+                f"Unknown eviction policy: {eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'tiered', 'arc'."
             )
         self.reset()
 
