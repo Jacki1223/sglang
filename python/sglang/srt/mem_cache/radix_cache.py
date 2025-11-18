@@ -35,6 +35,8 @@ from sglang.srt.disaggregation.kv_events import (
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.evict_policy import (
+    ARCManager,
+    ARCStrategy,
     EvictionStrategy,
     FIFOStrategy,
     FILOStrategy,
@@ -93,6 +95,12 @@ class TreeNode:
         self.host_value: Optional[torch.Tensor] = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
+
+        # ARC (Adaptive Replacement Cache) specific attributes
+        # List type: 'T1' (recent), 'T2' (frequent), 'B1' (ghost T1), 'B2' (ghost T2), or None
+        self.arc_list_type: Optional[str] = None
+        # Whether this is a ghost entry (in B1 or B2)
+        self.in_ghost: bool = False
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -226,17 +234,32 @@ class RadixCache(BasePrefixCache):
 
         if eviction_policy.lower() == "lru":
             self.eviction_strategy: EvictionStrategy = LRUStrategy()
+            self.arc_manager = None
         elif eviction_policy.lower() == "lfu":
             self.eviction_strategy: EvictionStrategy = LFUStrategy()
+            self.arc_manager = None
         elif eviction_policy.lower() == "fifo":
             self.eviction_strategy: EvictionStrategy = FIFOStrategy()
+            self.arc_manager = None
         elif eviction_policy.lower() == "mru":
             self.eviction_strategy: EvictionStrategy = MRUStrategy()
+            self.arc_manager = None
         elif eviction_policy.lower() == "filo":
             self.eviction_strategy: EvictionStrategy = FILOStrategy()
+            self.arc_manager = None
+        elif eviction_policy.lower() == "arc":
+            # ARC requires knowing the cache size
+            # We'll use a reasonable default based on the token pool size
+            cache_size = (
+                self.token_to_kv_pool_allocator.size
+                if self.token_to_kv_pool_allocator
+                else 10000
+            )
+            self.arc_manager = ARCManager(cache_size=cache_size)
+            self.eviction_strategy: EvictionStrategy = ARCStrategy(self.arc_manager)
         else:
             raise ValueError(
-                f"Unknown eviction policy: {eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo'."
+                f"Unknown eviction policy: {eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'arc'."
             )
         self.reset()
 
@@ -502,6 +525,10 @@ class RadixCache(BasePrefixCache):
             num_evicted += len(x.value)
             self._delete_leaf(x)
 
+            # Notify ARC manager of eviction
+            if self.arc_manager:
+                self.arc_manager.on_eviction(x, keep_ghost=True)
+
             if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
@@ -566,12 +593,22 @@ class RadixCache(BasePrefixCache):
         access_time = time.monotonic()
         node.last_access_time = access_time
 
+        # Update ARC state for cache hit on root node
+        if self.arc_manager and node != self.root_node:
+            self.arc_manager.on_cache_hit(node)
+
         child_key = self.get_child_key_fn(key)
 
         value = []
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = access_time
+            child.hit_count += 1  # Increment hit count for ARC and LFU
+
+            # Update ARC state for cache hit
+            if self.arc_manager:
+                self.arc_manager.on_cache_hit(child)
+
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
