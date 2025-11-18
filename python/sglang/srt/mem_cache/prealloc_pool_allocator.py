@@ -93,8 +93,6 @@ class PreallocPoolAllocator(PagedTokenToKVPoolAllocator):
             enable_prealloc: 是否启用预分配池（默认从环境变量读取）
             prealloc_ratio: 预分配池占用总空间的比例（默认0.3）
         """
-        super().__init__(size, page_size, dtype, device, kvcache, need_sort)
-
         # 从环境变量读取配置
         if enable_prealloc is None:
             enable_prealloc = get_bool_env_var("SGLANG_ENABLE_KV_POOL_PREALLOC", False)
@@ -103,7 +101,15 @@ class PreallocPoolAllocator(PagedTokenToKVPoolAllocator):
                 get_int_env_var("SGLANG_KV_POOL_PREALLOC_RATIO", "30")
             ) / 100.0
 
+        # 必须在调用super().__init__()之前设置，因为父类的__init__会调用clear()
         self.enable_prealloc = enable_prealloc
+        self.block_pools = {}
+        self.allocated_blocks = {}
+        self.next_block_id = 0
+        self.total_prealloc_pages = 0
+
+        # 调用父类初始化（会调用clear()）
+        super().__init__(size, page_size, dtype, device, kvcache, need_sort)
 
         if self.enable_prealloc:
             self._init_prealloc_pools(prealloc_ratio)
