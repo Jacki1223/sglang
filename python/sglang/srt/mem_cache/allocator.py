@@ -618,21 +618,29 @@ class PreallocatedPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         enable_prealloc: bool = True,
         prealloc_bucket_sizes: Optional[list] = None,
         prealloc_ratio: float = 0.8,
+        use_optimized: bool = True,  # Use optimized version by default
     ):
         # Initialize parent allocator
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
 
         self.enable_prealloc = enable_prealloc
         self.prealloc_ratio = prealloc_ratio
+        self.use_optimized = use_optimized
 
         if self.enable_prealloc:
-            from sglang.srt.mem_cache.preallocated_pool import PreallocatedKVBlockPool
+            # Choose implementation
+            if use_optimized:
+                from sglang.srt.mem_cache.preallocated_pool_optimized import OptimizedPreallocatedKVBlockPool as PoolClass
+                impl_name = "Optimized"
+            else:
+                from sglang.srt.mem_cache.preallocated_pool import PreallocatedKVBlockPool as PoolClass
+                impl_name = "Standard"
 
             # Calculate pages to use for preallocation pool
             prealloc_pages = int(self.num_pages * prealloc_ratio)
 
             # Initialize preallocation pool
-            self.prealloc_pool = PreallocatedKVBlockPool(
+            self.prealloc_pool = PoolClass(
                 total_pages=prealloc_pages,
                 page_size=page_size,
                 device=device,
@@ -649,7 +657,7 @@ class PreallocatedPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             )
 
             logger.info(
-                f"PreallocatedPagedTokenToKVPoolAllocator initialized: "
+                f"PreallocatedPagedTokenToKVPoolAllocator initialized ({impl_name}): "
                 f"total_pages={self.num_pages}, prealloc_pages={prealloc_pages} ({prealloc_ratio:.1%}), "
                 f"fallback_pages={len(self.free_pages)}"
             )
