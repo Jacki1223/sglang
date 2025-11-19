@@ -492,6 +492,15 @@ class Scheduler(
         ) / envs.SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS.get()
         self.new_token_ratio = self.init_new_token_ratio
 
+        # Init scheduling optimizations
+        self.optimizations_enabled = server_args.enable_scheduling_optimizations
+        if self.optimizations_enabled:
+            self._init_scheduling_optimizations(server_args)
+        else:
+            self.token_ratio_predictor = None
+            self.tiered_lpm_policy = None
+            self.adaptive_batch_sizer = None
+
         # Init watchdog thread
         self.watchdog_timeout = server_args.watchdog_timeout
         t = threading.Thread(target=self.watchdog_thread, daemon=True)
@@ -964,6 +973,65 @@ class Scheduler(
         #       we shall keep its reference not being release during all the forwarding pass
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         self.batch_record_buf[self.batch_record_ct] = model_worker_batch
+
+    def _init_scheduling_optimizations(self, server_args: ServerArgs):
+        """Initialize scheduling optimization components"""
+        logger.info("Initializing scheduling optimizations...")
+
+        # 1. Adaptive Token Ratio Predictor
+        if server_args.enable_adaptive_token_ratio:
+            from sglang.srt.managers.optimizations.adaptive_token_ratio import (
+                AdaptiveTokenRatioPredictor,
+            )
+
+            self.token_ratio_predictor = AdaptiveTokenRatioPredictor(
+                window_size=server_args.token_ratio_window_size,
+                percentile=server_args.token_ratio_percentile,
+            )
+            logger.info(
+                f"Initialized AdaptiveTokenRatioPredictor "
+                f"(window={server_args.token_ratio_window_size}, "
+                f"percentile={server_args.token_ratio_percentile})"
+            )
+        else:
+            self.token_ratio_predictor = None
+
+        # 2. Tiered LPM Policy
+        if server_args.enable_tiered_lpm and server_args.schedule_policy == "lpm":
+            from sglang.srt.managers.optimizations.tiered_lpm import TieredLPMPolicy
+
+            self.tiered_lpm_policy = TieredLPMPolicy(
+                tier_size=server_args.tiered_lpm_tier_size,
+                max_tiers=server_args.tiered_lpm_max_tiers,
+                tree_cache=self.tree_cache,
+            )
+            logger.info(
+                f"Initialized TieredLPMPolicy "
+                f"(tier_size={server_args.tiered_lpm_tier_size}, "
+                f"max_tiers={server_args.tiered_lpm_max_tiers})"
+            )
+        else:
+            self.tiered_lpm_policy = None
+
+        # 3. Adaptive Batch Sizer
+        if server_args.enable_adaptive_batch_sizer:
+            from sglang.srt.managers.optimizations.adaptive_batch_sizer import (
+                AdaptiveBatchSizer,
+            )
+
+            self.adaptive_batch_sizer = AdaptiveBatchSizer(
+                max_batch_size=self.max_running_requests or 256,
+                memory_threshold=server_args.adaptive_batch_memory_threshold,
+            )
+            logger.info(
+                f"Initialized AdaptiveBatchSizer "
+                f"(max_batch={self.max_running_requests}, "
+                f"threshold={server_args.adaptive_batch_memory_threshold})"
+            )
+        else:
+            self.adaptive_batch_sizer = None
+
+        logger.info("Scheduling optimizations initialized successfully!")
 
     def init_moe_config(self):
         if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
@@ -1775,8 +1843,11 @@ class Scheduler(
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
 
-        # Get priority queue
-        self.policy.calc_priority(self.waiting_queue)
+        # Get priority queue (use tiered LPM if enabled and applicable)
+        if self.tiered_lpm_policy is not None and self.optimizations_enabled:
+            self.tiered_lpm_policy.calc_priority(self.waiting_queue)
+        else:
+            self.policy.calc_priority(self.waiting_queue)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -1785,12 +1856,22 @@ class Scheduler(
             return None
 
         # Prefill policy
+        # Use predicted token ratio if optimization is enabled
+        effective_token_ratio = self.new_token_ratio
+        if self.token_ratio_predictor is not None and self.optimizations_enabled:
+            # For now, use a conservative global prediction
+            # TODO: Per-request prediction could be more accurate
+            if len(self.token_ratio_predictor.global_history) >= 10:
+                effective_token_ratio = max(
+                    self.token_ratio_predictor.global_ratio, self.min_new_token_ratio
+                )
+
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             self.running_batch,
-            self.new_token_ratio,
+            effective_token_ratio,
             self.max_prefill_tokens,
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
@@ -1934,6 +2015,13 @@ class Scheduler(
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
+        # Update token ratio predictor for finished requests
+        if self.token_ratio_predictor is not None and self.optimizations_enabled:
+            for req in batch.reqs:
+                if req.finished():
+                    actual_output_len = len(req.output_ids)
+                    self.token_ratio_predictor.update_on_finish(req, actual_output_len)
+
         batch.filter_batch()
         if batch.is_empty():
             batch.batch_is_full = False
@@ -1960,6 +2048,10 @@ class Scheduler(
                 f"#retracted_reqs: {len(retracted_reqs)}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
             )
+
+            # Update token ratio predictor on retract
+            if self.token_ratio_predictor is not None and self.optimizations_enabled:
+                self.token_ratio_predictor.update_on_retract()
 
             for req in retracted_reqs:
                 self._add_request_to_queue(req, is_retracted=True)
