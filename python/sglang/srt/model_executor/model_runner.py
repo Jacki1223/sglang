@@ -97,6 +97,7 @@ from sglang.srt.mem_cache.allocator import (
     SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.prealloc_pool_allocator import PreallocPoolAllocator
 from sglang.srt.mem_cache.allocator_ascend import AscendPagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (
     AscendMLAPagedTokenToKVPool,
@@ -1902,14 +1903,34 @@ class ModelRunner:
                         )
                 else:
                     assert not self.is_hybrid
-                    self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
-                        dtype=self.kv_cache_dtype,
-                        device=self.device,
-                        kvcache=self.token_to_kv_pool,
-                        need_sort=need_sort,
-                    )
+
+                    # 检查是否启用预分配池
+                    enable_prealloc = getattr(self.server_args, 'enable_kv_pool_prealloc', False)
+
+                    if enable_prealloc:
+                        # 使用预分配池allocator
+                        prealloc_ratio = getattr(self.server_args, 'kv_pool_prealloc_ratio', 0.3)
+                        self.token_to_kv_pool_allocator = PreallocPoolAllocator(
+                            self.max_total_num_tokens,
+                            page_size=self.page_size,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=self.token_to_kv_pool,
+                            need_sort=need_sort,
+                            enable_prealloc=True,
+                            prealloc_ratio=prealloc_ratio,
+                        )
+                        logger.info("Using PreallocPoolAllocator for KV cache management")
+                    else:
+                        # 使用标准Paged allocator
+                        self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                            self.max_total_num_tokens,
+                            page_size=self.page_size,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=self.token_to_kv_pool,
+                            need_sort=need_sort,
+                        )
         else:
             assert self.is_draft_worker
 
