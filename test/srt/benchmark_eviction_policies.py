@@ -35,26 +35,49 @@ class WorkloadGenerator:
         """
         Generate requests with shared prefixes (simulates batch processing).
 
+        Creates multiple prefix groups that compete for cache space.
+        Requests are interleaved to create eviction pressure.
+
         Args:
             num_requests: Number of requests to generate
-            prefix_len: Length of common prefix
+            prefix_len: Length of common prefix per group
             suffix_len: Length of unique suffix per request
 
         Returns:
             List of token sequences
         """
-        # Common prefix for all requests
-        common_prefix = torch.randint(
-            0, 50000, (prefix_len,), generator=self.rng
-        ).tolist()
+        # Create multiple prefix groups (5 groups competing for cache)
+        num_groups = 5
+        requests_per_group = num_requests // num_groups
 
+        # Generate prefix for each group
+        prefix_groups = []
+        for _ in range(num_groups):
+            prefix = torch.randint(
+                0, 50000, (prefix_len,), generator=self.rng
+            ).tolist()
+            prefix_groups.append(prefix)
+
+        # Generate requests interleaved by group
+        # This creates competition: which prefix should we keep?
         sequences = []
-        for _ in range(num_requests):
-            # Each request has the common prefix + unique suffix
+        for round_idx in range(requests_per_group):
+            for group_idx in range(num_groups):
+                prefix = prefix_groups[group_idx]
+                suffix = torch.randint(
+                    0, 50000, (suffix_len,), generator=self.rng
+                ).tolist()
+                sequences.append(prefix + suffix)
+
+        # Handle remaining requests
+        remaining = num_requests - len(sequences)
+        for i in range(remaining):
+            group_idx = i % num_groups
+            prefix = prefix_groups[group_idx]
             suffix = torch.randint(
                 0, 50000, (suffix_len,), generator=self.rng
             ).tolist()
-            sequences.append(common_prefix + suffix)
+            sequences.append(prefix + suffix)
 
         return sequences
 
@@ -257,8 +280,8 @@ class CacheBenchmark:
 def compare_policies(
     workload_type: str,
     num_requests: int = 1000,
-    cache_size: int = 10000,
-    page_size: int = 16,
+    cache_size: int = 2000,  # Reduced for more pressure
+    page_size: int = 1,      # Token-level granularity
 ) -> None:
     """
     Compare all eviction policies on a specific workload.
@@ -356,10 +379,10 @@ def main():
         help="Number of requests to process",
     )
     parser.add_argument(
-        "--cache-size", type=int, default=10000, help="Maximum cache size in tokens"
+        "--cache-size", type=int, default=2000, help="Maximum cache size in tokens"
     )
     parser.add_argument(
-        "--page-size", type=int, default=16, help="Page size for cache"
+        "--page-size", type=int, default=1, help="Page size for cache"
     )
     parser.add_argument(
         "--all-workloads",
