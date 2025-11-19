@@ -338,7 +338,8 @@ class TestEvictionWithValueAwareStrategies(unittest.TestCase):
         result = cache.match_prefix(RadixKey([1, 2]))
         old_node = result.last_device_node
         old_node.hit_count = 10  # Simulate high hit count
-        old_node.last_access_time = time.monotonic() - 100  # Old access
+        old_node.creation_time = time.monotonic() - 100  # Created long ago
+        old_node.last_access_time = time.monotonic() - 50  # Old access
 
         # Insert a new sequence
         cache.insert(RadixKey([3, 4]), torch.tensor([30, 40], dtype=torch.int64))
@@ -404,15 +405,16 @@ class TestComparisonWithBaseline(unittest.TestCase):
 
     def test_adaptive_vs_standard_lfu(self):
         """Compare AdaptiveLFU with standard LFU."""
-        # Create a frequently accessed node
+        # Create a frequently accessed node (mature - past protection period)
         frequent_node = TreeNode()
         frequent_node.hit_count = 10
-        frequent_node.last_access_time = 50.0
+        frequent_node.creation_time = time.monotonic() - 100  # Created long ago
+        frequent_node.last_access_time = time.monotonic() - 50  # Accessed a while ago
 
         # Create a new node with no hits
         new_node = TreeNode()
         new_node.hit_count = 0
-        new_node.last_access_time = 100.0
+        new_node.last_access_time = time.monotonic()  # Recently accessed
 
         # Standard LFU: new node has lowest priority, evicted immediately
         lfu_strategy = LFUStrategy()
