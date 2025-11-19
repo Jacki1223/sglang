@@ -340,6 +340,7 @@ class RadixCache(BasePrefixCache):
         eviction_policy: str = "lru",
         is_eagle: bool = False,
         vectorized_match: str = "none",  # "none", "numpy", or "torch"
+        fast_eviction: bool = True,  # Enable optimized eviction with leaf tracking
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -348,6 +349,7 @@ class RadixCache(BasePrefixCache):
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue = []
         self.is_eagle = is_eagle
+        self.fast_eviction = fast_eviction
 
         if enable_metrics:
             self.init_metrics_collector()
@@ -411,6 +413,10 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self._record_all_cleared_event()
+
+        # Initialize leaf node tracking for fast eviction
+        if self.fast_eviction:
+            self.leaf_nodes = set()  # Set of all leaf nodes with lock_ref == 0
 
     def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
         """Find the longest cached prefix of ``key`` in the radix tree.
@@ -680,6 +686,8 @@ class RadixCache(BasePrefixCache):
                 self.evictable_size_ -= len(node.key)
                 self.protected_size_ += len(node.key)
                 delta -= len(node.key)
+                # Node is being locked, remove from leaf set if it was a leaf
+                self._remove_leaf_node(node)
             node.lock_ref += 1
             node = node.parent
         return delta
@@ -695,6 +703,11 @@ class RadixCache(BasePrefixCache):
                 self.protected_size_ -= len(node.key)
                 delta += len(node.key)
             node.lock_ref -= 1
+
+            # If node just became unlocked and is a leaf, add to leaf set
+            if node.lock_ref == 0 and len(node.children) == 0:
+                self._add_leaf_node(node)
+
             if node.parent is None:
                 assert (
                     node is self.root_node
@@ -721,6 +734,29 @@ class RadixCache(BasePrefixCache):
         return torch.cat(values)
 
     ##### Internal Helper Functions #####
+
+    def _add_leaf_node(self, node: TreeNode):
+        """Add a node to the leaf set if it's an evictable leaf."""
+        if self.fast_eviction:
+            if len(node.children) == 0 and node.lock_ref == 0:
+                self.leaf_nodes.add(node)
+
+    def _remove_leaf_node(self, node: TreeNode):
+        """Remove a node from the leaf set."""
+        if self.fast_eviction:
+            self.leaf_nodes.discard(node)
+
+    def _update_leaf_status(self, node: TreeNode):
+        """Update a node's leaf status based on current state."""
+        if not self.fast_eviction:
+            return
+
+        is_evictable_leaf = (len(node.children) == 0 and node.lock_ref == 0)
+
+        if is_evictable_leaf:
+            self.leaf_nodes.add(node)
+        else:
+            self.leaf_nodes.discard(node)
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         access_time = time.monotonic()
@@ -799,6 +835,11 @@ class RadixCache(BasePrefixCache):
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             self._record_store_event(new_node)
+
+            # Update leaf tracking: node gains a child, new_node is a leaf
+            self._remove_leaf_node(node)  # node is no longer a leaf
+            self._add_leaf_node(new_node)  # new_node is a new leaf
+
         return total_prefix_length
 
     def _print_helper(self, node: TreeNode, indent: int):
@@ -820,11 +861,19 @@ class RadixCache(BasePrefixCache):
                 ), f"{key=}, {self.get_child_key_fn(child.key)=}"
 
     def _delete_leaf(self, node):
-        for k, v in node.parent.children.items():
+        # Remove node from leaf set
+        self._remove_leaf_node(node)
+
+        parent = node.parent
+        for k, v in parent.children.items():
             if v == node:
                 break
-        del node.parent.children[k]
+        del parent.children[k]
         self.evictable_size_ -= len(node.key)
+
+        # If parent now has no children and is unlocked, it becomes a leaf
+        if len(parent.children) == 0 and parent.lock_ref == 0:
+            self._add_leaf_node(parent)
 
     def _total_size_helper(self):
         total_size = 0
@@ -839,6 +888,16 @@ class RadixCache(BasePrefixCache):
         return total_size
 
     def _collect_leaves(self):
+        """Collect all evictable leaf nodes.
+
+        If fast_eviction is enabled, returns the pre-maintained leaf set.
+        Otherwise, performs a full tree traversal (O(n) where n is total nodes).
+        """
+        if self.fast_eviction:
+            # O(1) - just return the maintained set as a list
+            return list(self.leaf_nodes)
+
+        # Original O(n) implementation - traverse entire tree
         ret_list = []
         stack = list(self.root_node.children.values())
 
