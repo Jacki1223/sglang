@@ -20,7 +20,8 @@ Page-aligned memory pool.
 """
 
 import abc
-from typing import TYPE_CHECKING
+import logging
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import triton
@@ -31,6 +32,8 @@ from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
+
+logger = logging.getLogger(__name__)
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
@@ -578,3 +581,286 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+
+
+class PreallocatedPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
+    """
+    Enhanced paged allocator with preallocation pool support.
+
+    This allocator extends PagedTokenToKVPoolAllocator by adding a preallocation
+    pool for common block sizes, inspired by vLLM's BlockManager. This reduces
+    allocation overhead and improves memory efficiency for common allocation patterns.
+
+    The allocator maintains both:
+    1. Preallocation pool: For fast allocation of common sizes
+    2. Fallback to parent allocator: For sizes not in preallocation pool
+
+    Args:
+        size: Total size of the pool
+        page_size: Size of each page
+        dtype: Data type for tensors
+        device: Device to allocate on
+        kvcache: KV cache instance
+        need_sort: Whether to sort free pages
+        enable_prealloc: Whether to enable preallocation pool
+        prealloc_bucket_sizes: List of bucket sizes for preallocation pool
+        prealloc_ratio: Ratio of pages to use for preallocation (0.0-1.0)
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        device: str,
+        kvcache: KVCache,
+        need_sort: bool,
+        enable_prealloc: bool = True,
+        prealloc_bucket_sizes: Optional[list] = None,
+        prealloc_ratio: float = 0.8,
+    ):
+        # Initialize parent allocator
+        super().__init__(size, page_size, dtype, device, kvcache, need_sort)
+
+        self.enable_prealloc = enable_prealloc
+        self.prealloc_ratio = prealloc_ratio
+
+        if self.enable_prealloc:
+            from sglang.srt.mem_cache.preallocated_pool import PreallocatedKVBlockPool
+
+            # Calculate pages to use for preallocation pool
+            prealloc_pages = int(self.num_pages * prealloc_ratio)
+
+            # Initialize preallocation pool
+            self.prealloc_pool = PreallocatedKVBlockPool(
+                total_pages=prealloc_pages,
+                page_size=page_size,
+                device=device,
+                bucket_sizes=prealloc_bucket_sizes,
+                enable_splitting=True,
+                debug_mode=self.debug_mode,
+            )
+
+            # Reduce parent allocator's free pages by the amount used for preallocation
+            # The preallocation pool manages pages [1, prealloc_pages]
+            # Parent allocator manages pages [prealloc_pages+1, num_pages]
+            self.free_pages = torch.arange(
+                prealloc_pages + 1, self.num_pages + 1, dtype=torch.int64, device=self.device
+            )
+
+            logger.info(
+                f"PreallocatedPagedTokenToKVPoolAllocator initialized: "
+                f"total_pages={self.num_pages}, prealloc_pages={prealloc_pages} ({prealloc_ratio:.1%}), "
+                f"fallback_pages={len(self.free_pages)}"
+            )
+        else:
+            self.prealloc_pool = None
+            logger.info("PreallocatedPagedTokenToKVPoolAllocator initialized with preallocation disabled")
+
+    def alloc(self, need_size: int):
+        """
+        Allocate pages with preallocation pool support.
+
+        Strategy:
+        1. Try to allocate from preallocation pool if enabled
+        2. Fallback to parent allocator if preallocation fails or disabled
+
+        Args:
+            need_size: Number of tokens to allocate
+
+        Returns:
+            Allocated page indices, or None if allocation failed
+        """
+        if self.debug_mode:
+            assert (
+                need_size % self.page_size == 0
+            ), f"The allocation size should be page-aligned: {need_size} % {self.page_size} != 0"
+
+        num_pages = need_size // self.page_size
+
+        # Try preallocation pool first
+        if self.enable_prealloc and self.prealloc_pool is not None:
+            prealloc_pages = self.prealloc_pool.allocate(num_pages)
+            if prealloc_pages is not None:
+                # Convert page indices to token indices
+                out_indices = (
+                    prealloc_pages[:, None] * self.page_size
+                    + torch.arange(self.page_size, device=self.device)
+                ).reshape(-1)
+
+                if self.debug_mode:
+                    logger.debug(f"Allocated {num_pages} pages from preallocation pool")
+
+                return out_indices
+
+        # Fallback to parent allocator
+        return super().alloc(need_size)
+
+    def alloc_extend(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+    ):
+        """
+        Allocate for extend operation.
+
+        For extend operations, we use the parent allocator's kernel-based approach
+        as it's optimized for this use case and handles complex page alignment.
+
+        Args:
+            prefix_lens: Prefix lengths tensor
+            prefix_lens_cpu: Prefix lengths on CPU
+            seq_lens: Sequence lengths tensor
+            seq_lens_cpu: Sequence lengths on CPU
+            last_loc: Last location tensor
+            extend_num_tokens: Number of tokens to extend
+
+        Returns:
+            Allocated indices
+        """
+        # For extend, use parent allocator's optimized kernel
+        return super().alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
+
+    def alloc_decode(
+        self,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+    ):
+        """
+        Allocate for decode operation.
+
+        For decode operations, we use the parent allocator's kernel-based approach
+        as it's optimized for this use case.
+
+        Args:
+            seq_lens: Sequence lengths tensor
+            seq_lens_cpu: Sequence lengths on CPU
+            last_loc: Last location tensor
+
+        Returns:
+            Allocated indices
+        """
+        # For decode, use parent allocator's optimized kernel
+        return super().alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+
+    def free(self, free_index: torch.Tensor):
+        """
+        Free pages back to appropriate pool.
+
+        Strategy:
+        1. Determine if pages belong to preallocation pool or parent allocator
+        2. Return pages to the appropriate pool
+
+        Args:
+            free_index: Indices to free
+        """
+        if free_index.numel() == 0:
+            return
+
+        if not self.enable_prealloc or self.prealloc_pool is None:
+            # No preallocation pool, use parent allocator
+            return super().free(free_index)
+
+        # Convert token indices to page indices
+        free_page_indices = torch.unique(free_index // self.page_size)
+
+        # Calculate preallocation pool boundary
+        prealloc_pages = int(self.num_pages * self.prealloc_ratio)
+
+        # Split pages into prealloc and fallback
+        prealloc_mask = free_page_indices <= prealloc_pages
+        prealloc_pages_to_free = free_page_indices[prealloc_mask]
+        fallback_pages_to_free = free_page_indices[~prealloc_mask]
+
+        # Free to preallocation pool
+        if prealloc_pages_to_free.numel() > 0:
+            self.prealloc_pool.free(prealloc_pages_to_free)
+
+            if self.debug_mode:
+                logger.debug(f"Freed {len(prealloc_pages_to_free)} pages to preallocation pool")
+
+        # Free to parent allocator
+        if fallback_pages_to_free.numel() > 0:
+            if self.is_not_in_free_group:
+                if self.need_sort:
+                    self.release_pages = torch.cat((fallback_pages_to_free, self.release_pages))
+                else:
+                    self.free_pages = torch.cat((fallback_pages_to_free, self.free_pages))
+            else:
+                self.free_group.append(fallback_pages_to_free)
+
+            if self.debug_mode:
+                logger.debug(f"Freed {len(fallback_pages_to_free)} pages to fallback pool")
+
+    def available_size(self):
+        """
+        Calculate total available size.
+
+        Returns:
+            Total available size in tokens
+        """
+        if not self.enable_prealloc or self.prealloc_pool is None:
+            return super().available_size()
+
+        # Sum of preallocation pool and parent allocator
+        prealloc_available = self.prealloc_pool.available_pages() * self.page_size
+        fallback_available = (len(self.free_pages) + len(self.release_pages)) * self.page_size
+
+        return prealloc_available + fallback_available
+
+    def clear(self):
+        """Clear all pools and reinitialize."""
+        super().clear()
+
+        if self.enable_prealloc and self.prealloc_pool is not None:
+            self.prealloc_pool.clear()
+
+            # Reset free pages for fallback allocator
+            prealloc_pages = int(self.num_pages * self.prealloc_ratio)
+            self.free_pages = torch.arange(
+                prealloc_pages + 1, self.num_pages + 1, dtype=torch.int64, device=self.device
+            )
+
+    def get_statistics(self) -> dict:
+        """
+        Get detailed statistics about allocator usage.
+
+        Returns:
+            Dictionary with statistics
+        """
+        stats = {
+            "total_pages": self.num_pages,
+            "page_size": self.page_size,
+            "enable_prealloc": self.enable_prealloc,
+        }
+
+        if self.enable_prealloc and self.prealloc_pool is not None:
+            stats["prealloc"] = self.prealloc_pool.get_statistics()
+            stats["fallback_available_pages"] = len(self.free_pages) + len(self.release_pages)
+        else:
+            stats["fallback_available_pages"] = len(self.free_pages) + len(self.release_pages)
+
+        stats["total_available_size"] = self.available_size()
+
+        return stats
+
+    def __repr__(self) -> str:
+        if self.enable_prealloc and self.prealloc_pool is not None:
+            return (f"PreallocatedPagedTokenToKVPoolAllocator("
+                   f"total_pages={self.num_pages}, "
+                   f"prealloc_pool={self.prealloc_pool}, "
+                   f"fallback_pages={len(self.free_pages)})")
+        else:
+            return f"PreallocatedPagedTokenToKVPoolAllocator(prealloc_disabled, total_pages={self.num_pages})"
