@@ -150,7 +150,16 @@ NSA_CHOICES = [
     "aiter",
 ]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
+RADIX_EVICTION_POLICY_CHOICES = [
+    "lru",
+    "lfu",
+    "fifo",
+    "mru",
+    "filo",
+    "value_aware_lru",
+    "adaptive_lfu",
+    "value_aware_adaptive_lfu",
+]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -2261,7 +2270,17 @@ class ServerArgs:
             type=str,
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
-            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used.",
+            help=(
+                "The eviction policy for radix tree KV cache. Options: "
+                "'lru' (Least Recently Used), "
+                "'lfu' (Least Frequently Used), "
+                "'fifo' (First In First Out), "
+                "'mru' (Most Recently Used), "
+                "'filo' (First In Last Out), "
+                "'value_aware_lru' (LRU with value-based protection for common prefixes), "
+                "'adaptive_lfu' (LFU with protection period for new nodes), "
+                "'value_aware_adaptive_lfu' (combined value-aware and adaptive strategy)."
+            ),
         )
 
         # Runtime options
