@@ -1,15 +1,13 @@
 """
-优化组件的单元测试
+AdaptiveTokenRatioPredictor的单元测试
 """
 
 import unittest
-from unittest.mock import Mock, MagicMock
+from unittest.mock import Mock
 
 from sglang.srt.managers.optimizations.adaptive_token_ratio import (
     AdaptiveTokenRatioPredictor,
 )
-from sglang.srt.managers.optimizations.tiered_lpm import TieredLPMPolicy
-from sglang.srt.managers.optimizations.adaptive_batch_sizer import AdaptiveBatchSizer
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.io_struct import SamplingParams
 
@@ -99,7 +97,60 @@ class TestAdaptiveTokenRatioPredictor(unittest.TestCase):
         self.assertEqual(stats["retract_rate"], 0.05)
         self.assertGreater(stats["prediction_accuracy"], 0.8)  # 误差在10%内
 
-    def _create_mock_req(self, input_len, max_new_tokens):
+    def test_user_level_prediction(self):
+        """测试用户级预测"""
+        # 为用户A添加历史数据（高使用率）
+        for _ in range(30):
+            req = self._create_mock_req(input_len=100, max_new_tokens=100, user_id="user_a")
+            self.predictor.update_on_finish(req, actual_output_len=90)
+
+        # 为用户B添加历史数据（低使用率）
+        for _ in range(30):
+            req = self._create_mock_req(input_len=100, max_new_tokens=100, user_id="user_b")
+            self.predictor.update_on_finish(req, actual_output_len=30)
+
+        # 用户A应该得到高预测
+        req_a = self._create_mock_req(input_len=100, max_new_tokens=100, user_id="user_a")
+        ratio_a = self.predictor.predict_ratio(req_a)
+        self.assertGreater(ratio_a, 0.8)
+
+        # 用户B应该得到低预测
+        req_b = self._create_mock_req(input_len=100, max_new_tokens=100, user_id="user_b")
+        ratio_b = self.predictor.predict_ratio(req_b)
+        self.assertLess(ratio_b, 0.4)
+
+    def test_window_size_limit(self):
+        """测试窗口大小限制"""
+        # 添加超过窗口大小的数据
+        for i in range(150):
+            req = self._create_mock_req(input_len=100, max_new_tokens=100)
+            self.predictor.update_on_finish(req, actual_output_len=50)
+
+        # 历史记录应该被限制在window_size
+        self.assertLessEqual(len(self.predictor.global_history), self.predictor.window_size)
+
+    def test_percentile_adjustment(self):
+        """测试不同百分位数的影响"""
+        # 创建不同percentile的预测器
+        predictor_50 = AdaptiveTokenRatioPredictor(window_size=100, percentile=50)
+        predictor_90 = AdaptiveTokenRatioPredictor(window_size=100, percentile=90)
+
+        # 添加相同的历史数据
+        for _ in range(60):
+            req = self._create_mock_req(input_len=100, max_new_tokens=100)
+            # 模拟变化的输出长度：30-90
+            output_len = 30 + (_ % 60)
+            predictor_50.update_on_finish(req, actual_output_len=output_len)
+            predictor_90.update_on_finish(req, actual_output_len=output_len)
+
+        req = self._create_mock_req(input_len=100, max_new_tokens=100)
+
+        # 90分位数应该比50分位数更保守（更高）
+        ratio_50 = predictor_50.predict_ratio(req)
+        ratio_90 = predictor_90.predict_ratio(req)
+        self.assertLess(ratio_50, ratio_90)
+
+    def _create_mock_req(self, input_len, max_new_tokens, user_id=None):
         """创建模拟请求"""
         req = Mock(spec=Req)
         req.origin_input_ids = [1] * input_len
@@ -107,176 +158,12 @@ class TestAdaptiveTokenRatioPredictor(unittest.TestCase):
         req.sampling_params = Mock(spec=SamplingParams)
         req.sampling_params.max_new_tokens = max_new_tokens
         req.rid = f"req_{id(req)}"
-        return req
 
+        # 添加user_id（如果有）
+        if user_id:
+            # 某些请求可能有user_id字段
+            req.user_id = user_id
 
-class TestTieredLPMPolicy(unittest.TestCase):
-    """测试分层LPM策略"""
-
-    def setUp(self):
-        self.tree_cache = self._create_mock_tree_cache()
-        self.policy = TieredLPMPolicy(tier_size=32, max_tiers=4, tree_cache=self.tree_cache)
-
-    def test_small_queue_uses_standard_lpm(self):
-        """测试小队列使用标准LPM"""
-        queue = [self._create_mock_req(i) for i in range(20)]
-        prefix_computed = self.policy.calc_priority(queue)
-
-        self.assertTrue(prefix_computed)
-        # 应该按前缀长度降序排序
-        prefix_lens = [len(req.prefix_indices) for req in queue]
-        self.assertEqual(prefix_lens, sorted(prefix_lens, reverse=True))
-
-        stats = self.policy.get_statistics()
-        self.assertEqual(stats["tiered_sorts"], 0)
-
-    def test_large_queue_uses_tiered_lpm(self):
-        """测试大队列使用分层LPM"""
-        queue = [self._create_mock_req(i) for i in range(150)]
-        prefix_computed = self.policy.calc_priority(queue)
-
-        self.assertTrue(prefix_computed)
-
-        stats = self.policy.get_statistics()
-        self.assertEqual(stats["tiered_sorts"], 1)
-
-    def test_tiering_preserves_fcfs_across_tiers(self):
-        """测试分层保持了层间FCFS"""
-        queue = [self._create_mock_req(i) for i in range(100)]
-
-        # 记录原始顺序（按层）
-        tier_size = 25  # 100/4=25
-        original_tier_0 = queue[:tier_size]
-
-        self.policy.calc_priority(queue)
-
-        # 检查第一层的请求仍然在前25个位置
-        new_tier_0_rids = {req.rid for req in queue[:tier_size]}
-        original_tier_0_rids = {req.rid for req in original_tier_0}
-        self.assertEqual(new_tier_0_rids, original_tier_0_rids)
-
-    def _create_mock_tree_cache(self):
-        """创建模拟树缓存"""
-        cache = MagicMock()
-        cache.match_prefix = MagicMock(
-            side_effect=lambda rid, key: (
-                [1] * (hash(rid) % 50),  # 前缀长度（模拟）
-                None,  # last_node
-                None,  # last_host_node
-                0,  # host_hit_length
-            )
-        )
-        return cache
-
-    def _create_mock_req(self, idx):
-        """创建模拟请求"""
-        req = Mock(spec=Req)
-        req.rid = f"req_{idx}"
-        req.origin_input_ids = [1] * 100
-        req.output_ids = []
-        req.extra_key = None
-        req.prefix_indices = []
-        req.last_node = None
-        req.last_host_node = None
-        req.host_hit_length = 0
-        return req
-
-
-class TestAdaptiveBatchSizer(unittest.TestCase):
-    """测试自适应批大小调整器"""
-
-    def setUp(self):
-        self.sizer = AdaptiveBatchSizer(
-            max_batch_size=128, min_batch_size=1, memory_threshold=0.85
-        )
-
-    def test_empty_queue(self):
-        """测试空队列"""
-        size = self.sizer.get_optimal_batch_size([], current_memory_usage=0.5)
-        self.assertEqual(size, 0)
-
-    def test_memory_constraint(self):
-        """测试内存约束"""
-        queue = [self._create_mock_req(100, 100) for _ in range(200)]
-
-        # 低内存使用率
-        size_low_mem = self.sizer.get_optimal_batch_size(queue, current_memory_usage=0.5)
-        self.assertGreater(size_low_mem, 0)
-
-        # 高内存使用率
-        size_high_mem = self.sizer.get_optimal_batch_size(queue, current_memory_usage=0.95)
-
-        # 高内存时批大小应该更小
-        self.assertLess(size_high_mem, size_low_mem)
-
-    def test_complexity_constraint(self):
-        """测试复杂度约束"""
-        # 简单请求（短输入输出）
-        simple_queue = [self._create_mock_req(50, 50) for _ in range(100)]
-        size_simple = self.sizer.get_optimal_batch_size(
-            simple_queue, current_memory_usage=0.5
-        )
-
-        # 复杂请求（长输入输出）
-        complex_queue = [self._create_mock_req(2000, 2000) for _ in range(100)]
-        size_complex = self.sizer.get_optimal_batch_size(
-            complex_queue, current_memory_usage=0.5
-        )
-
-        # 复杂请求批大小应该更小
-        self.assertLess(size_complex, size_simple)
-
-    def test_performance_based_adjustment(self):
-        """测试基于性能的调整"""
-        queue = [self._create_mock_req(100, 100) for _ in range(200)]
-
-        # 模拟性能恶化（延迟增加，吞吐量不变）
-        for i in range(20):
-            self.sizer.update_metrics(
-                batch_size=64, latency=0.05 + i * 0.01, throughput=20000
-            )
-
-        size_after_degradation = self.sizer.get_optimal_batch_size(
-            queue, current_memory_usage=0.5
-        )
-
-        # 批大小应该减小
-        self.assertLess(size_after_degradation, 64)
-
-    def test_min_max_bounds(self):
-        """测试最小最大边界"""
-        queue = [self._create_mock_req(100, 100) for _ in range(200)]
-
-        # 即使内存很高，也不应该超过max
-        size = self.sizer.get_optimal_batch_size(queue, current_memory_usage=0.99)
-        self.assertLessEqual(size, self.sizer.max_batch_size)
-        self.assertGreaterEqual(size, self.sizer.min_batch_size)
-
-    def test_statistics(self):
-        """测试统计信息"""
-        queue = [self._create_mock_req(100, 100) for _ in range(100)]
-
-        # 多次调整
-        for _ in range(50):
-            self.sizer.get_optimal_batch_size(queue, current_memory_usage=0.5)
-
-        # 更新指标
-        for i in range(30):
-            self.sizer.update_metrics(batch_size=32, latency=0.05, throughput=25000)
-
-        stats = self.sizer.get_statistics()
-
-        self.assertGreater(stats["total_adjustments"], 0)
-        self.assertAlmostEqual(stats["avg_latency"], 0.05, places=4)
-        self.assertAlmostEqual(stats["avg_throughput"], 25000, places=0)
-        self.assertAlmostEqual(stats["avg_batch_size"], 32, places=0)
-
-    def _create_mock_req(self, input_len, max_new_tokens):
-        """创建模拟请求"""
-        req = Mock(spec=Req)
-        req.origin_input_ids = [1] * input_len
-        req.sampling_params = Mock(spec=SamplingParams)
-        req.sampling_params.max_new_tokens = max_new_tokens
         return req
 
 

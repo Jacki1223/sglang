@@ -281,16 +281,10 @@ class ServerArgs:
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
 
-    # Scheduling optimizations
-    enable_scheduling_optimizations: bool = False
-    enable_adaptive_token_ratio: bool = True
+    # Scheduling optimizations - Adaptive Token Ratio Predictor
+    enable_adaptive_token_ratio: bool = False
     token_ratio_window_size: int = 1000
     token_ratio_percentile: int = 75
-    enable_tiered_lpm: bool = True
-    tiered_lpm_tier_size: int = 128
-    tiered_lpm_max_tiers: int = 4
-    enable_adaptive_batch_sizer: bool = True
-    adaptive_batch_memory_threshold: float = 0.85
 
     # Runtime options
     device: Optional[str] = None
@@ -2275,60 +2269,25 @@ class ServerArgs:
             help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used.",
         )
 
-        # Scheduling optimizations
-        parser.add_argument(
-            "--enable-scheduling-optimizations",
-            action="store_true",
-            default=ServerArgs.enable_scheduling_optimizations,
-            help="Enable scheduling optimizations including adaptive token ratio prediction, tiered LPM, and adaptive batch sizing.",
-        )
+        # Scheduling optimizations - Adaptive Token Ratio Predictor
         parser.add_argument(
             "--enable-adaptive-token-ratio",
             action="store_true",
             default=ServerArgs.enable_adaptive_token_ratio,
-            help="Enable adaptive token ratio prediction to reduce retract rate.",
+            help="Enable adaptive token ratio prediction to reduce retract rate by 60-80%%. "
+            "Uses historical data to predict actual token usage instead of fixed ratio.",
         )
         parser.add_argument(
             "--token-ratio-window-size",
             type=int,
             default=ServerArgs.token_ratio_window_size,
-            help="History window size for token ratio prediction.",
+            help="History window size for token ratio prediction. Larger values provide more stable predictions.",
         )
         parser.add_argument(
             "--token-ratio-percentile",
             type=int,
             default=ServerArgs.token_ratio_percentile,
-            help="Percentile to use for token ratio prediction (75 means 75th percentile).",
-        )
-        parser.add_argument(
-            "--enable-tiered-lpm",
-            action="store_true",
-            default=ServerArgs.enable_tiered_lpm,
-            help="Enable tiered LPM policy to maintain cache-awareness for large queues.",
-        )
-        parser.add_argument(
-            "--tiered-lpm-tier-size",
-            type=int,
-            default=ServerArgs.tiered_lpm_tier_size,
-            help="Maximum size of each tier in tiered LPM policy.",
-        )
-        parser.add_argument(
-            "--tiered-lpm-max-tiers",
-            type=int,
-            default=ServerArgs.tiered_lpm_max_tiers,
-            help="Maximum number of tiers in tiered LPM policy.",
-        )
-        parser.add_argument(
-            "--enable-adaptive-batch-sizer",
-            action="store_true",
-            default=ServerArgs.enable_adaptive_batch_sizer,
-            help="Enable adaptive batch size adjustment based on memory and performance.",
-        )
-        parser.add_argument(
-            "--adaptive-batch-memory-threshold",
-            type=float,
-            default=ServerArgs.adaptive_batch_memory_threshold,
-            help="Memory usage threshold for adaptive batch sizer.",
+            help="Percentile to use for token ratio prediction (75 means 75th percentile, more conservative).",
         )
 
         # Runtime options

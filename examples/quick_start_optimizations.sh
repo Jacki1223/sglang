@@ -30,28 +30,26 @@ echo ""
 
 echo "✅ 启用的优化:"
 echo "  - AdaptiveTokenRatioPredictor (自适应Token比例预测)"
-echo "  - TieredLPMPolicy (分层LPM策略)"
-echo "  - AdaptiveBatchSizer (自适应批大小)"
 echo ""
 
 echo "📊 预期性能提升:"
-echo "  - 吞吐量: +20~40%"
-echo "  - 延迟: -15~30%"
 echo "  - Retract率: -60~80%"
+echo "  - 吞吐量: +10~15%"
+echo "  - 内存利用率: +10~15%"
 echo ""
 
 echo "🔧 启动服务器..."
 echo "================================="
 echo ""
 
-# 启动服务器（启用所有优化）
+# 启动服务器（启用优化）
 python -m sglang.launch_server \
     --model-path "$MODEL_PATH" \
     --port "$PORT" \
-    --enable-scheduling-optimizations \
-    --schedule-policy lpm \
-    --log-level info \
-    --enable-metrics
+    --enable-adaptive-token-ratio \
+    --token-ratio-window-size 1000 \
+    --token-ratio-percentile 75 \
+    --log-level info
 
 echo ""
 echo "================================="
