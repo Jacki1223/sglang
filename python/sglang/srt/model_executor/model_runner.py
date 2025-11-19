@@ -1902,14 +1902,64 @@ class ModelRunner:
                         )
                 else:
                     assert not self.is_hybrid
-                    self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
-                        dtype=self.kv_cache_dtype,
-                        device=self.device,
-                        kvcache=self.token_to_kv_pool,
-                        need_sort=need_sort,
-                    )
+
+                    # Check if adaptive page size allocator is enabled
+                    from sglang.srt.utils import get_bool_env_var
+                    enable_adaptive_page = get_bool_env_var("SGLANG_ENABLE_ADAPTIVE_PAGE")
+
+                    if enable_adaptive_page:
+                        # Use adaptive multi-tier page size allocator
+                        from sglang.srt.mem_cache.allocator_adaptive import (
+                            AdaptivePagedTokenToKVPoolAllocator
+                        )
+                        import os
+
+                        # Read page sizes configuration
+                        page_sizes_str = os.environ.get(
+                            "SGLANG_ADAPTIVE_PAGE_SIZES", "16,64,256"
+                        )
+                        page_sizes = [int(x.strip()) for x in page_sizes_str.split(",")]
+
+                        # Read page size ratios (optional)
+                        page_ratios = None
+                        page_ratios_str = os.environ.get("SGLANG_ADAPTIVE_PAGE_RATIOS", None)
+                        if page_ratios_str:
+                            # Format: "16:0.25,64:0.5,256:0.25"
+                            try:
+                                page_ratios = {}
+                                for pair in page_ratios_str.split(","):
+                                    size, ratio = pair.split(":")
+                                    page_ratios[int(size)] = float(ratio)
+                            except Exception:
+                                logger.warning(
+                                    "Invalid SGLANG_ADAPTIVE_PAGE_RATIOS format, using default ratios"
+                                )
+                                page_ratios = None
+
+                        self.token_to_kv_pool_allocator = AdaptivePagedTokenToKVPoolAllocator(
+                            size=self.max_total_num_tokens,
+                            page_sizes=page_sizes,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=self.token_to_kv_pool,
+                            need_sort=need_sort,
+                            page_size_ratios=page_ratios,
+                        )
+
+                        logger.info(
+                            f"Using AdaptivePagedTokenToKVPoolAllocator: "
+                            f"sizes={page_sizes}, ratios={page_ratios}"
+                        )
+                    else:
+                        # Use original fixed page size allocator
+                        self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                            self.max_total_num_tokens,
+                            page_size=self.page_size,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=self.token_to_kv_pool,
+                            need_sort=need_sort,
+                        )
         else:
             assert self.is_draft_worker
 
