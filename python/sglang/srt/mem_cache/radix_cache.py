@@ -498,8 +498,13 @@ class RadixCache(BasePrefixCache):
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
-            self.token_to_kv_pool_allocator.free(x.value)
-            num_evicted += len(x.value)
+            # Free the KV cache (if allocator exists)
+            if self.token_to_kv_pool_allocator is not None and x.value is not None:
+                self.token_to_kv_pool_allocator.free(x.value)
+                num_evicted += len(x.value)
+            elif x.value is not None:
+                # For testing without allocator, count the tokens
+                num_evicted += len(x.value)
             self._delete_leaf(x)
 
             if len(x.parent.children) == 0 and x.parent.lock_ref == 0:

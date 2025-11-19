@@ -124,24 +124,22 @@ class PersistentHeapRadixCache(RadixCache):
             cleanup_interval: Minimum number of evictions between cleanups
             **kwargs: Keyword arguments passed to RadixCache.__init__
         """
-        super().__init__(*args, **kwargs)
-
-        # Persistent eviction heap (min-heap of HeapEntry objects)
+        # Initialize heap-related attributes BEFORE calling super().__init__()
+        # because parent's __init__ will call reset() which needs these attributes
         self._eviction_heap: List[HeapEntry] = []
-
-        # Track deleted entries for cleanup
         self._deleted_count = 0
         self._cleanup_threshold = cleanup_threshold
         self._eviction_count = 0
         self._cleanup_interval = cleanup_interval
-
-        # Statistics
         self._stats = {
             'heap_cleanups': 0,
             'total_evictions': 0,
-            'heap_hits': 0,  # Valid entries popped
-            'heap_skips': 0,  # Deleted entries skipped
+            'heap_hits': 0,
+            'heap_skips': 0,
         }
+
+        # Call parent init (which will call reset())
+        super().__init__(*args, **kwargs)
 
     def reset(self):
         """Reset the cache and clear the persistent heap."""
@@ -187,9 +185,13 @@ class PersistentHeapRadixCache(RadixCache):
             assert node.lock_ref == 0, f"Attempted to evict locked node {node.id}"
             assert len(node.children) == 0, f"Attempted to evict non-leaf node {node.id}"
 
-            # Free the KV cache
-            self.token_to_kv_pool_allocator.free(node.value)
-            num_evicted += len(node.value)
+            # Free the KV cache (if allocator exists)
+            if self.token_to_kv_pool_allocator is not None and node.value is not None:
+                self.token_to_kv_pool_allocator.free(node.value)
+                num_evicted += len(node.value)
+            elif node.value is not None:
+                # For testing without allocator, count the tokens
+                num_evicted += len(node.value)
 
             # Delete the leaf
             self._delete_leaf(node)
