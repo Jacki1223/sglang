@@ -102,6 +102,7 @@ from sgl_kernel.quantization import (
     ggml_mul_mat_vec_a8,
 )
 from sgl_kernel.sampling import (
+    fused_sampling_from_logits,
     min_p_sampling_from_probs,
     top_k_mask_logits,
     top_k_renorm_prob,
