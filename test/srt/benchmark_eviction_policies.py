@@ -15,6 +15,7 @@ import argparse
 import time
 from collections import defaultdict
 from typing import List, Tuple
+from unittest.mock import Mock
 
 import torch
 
@@ -170,10 +171,15 @@ class CacheBenchmark:
         Returns:
             Dictionary with benchmark results
         """
+        # Create a mock allocator for benchmarking
+        mock_allocator = Mock()
+        mock_allocator.device = torch.device("cpu")
+        mock_allocator.free = Mock()  # Mock the free method
+
         # Create cache
         cache = RadixCache(
             req_to_token_pool=None,
-            token_to_kv_pool_allocator=None,
+            token_to_kv_pool_allocator=mock_allocator,
             page_size=self.page_size,
             eviction_policy=self.eviction_policy,
         )
