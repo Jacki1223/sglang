@@ -35,12 +35,15 @@ from sglang.srt.disaggregation.kv_events import (
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.evict_policy import (
+    AdaptiveLFUStrategy,
     EvictionStrategy,
     FIFOStrategy,
     FILOStrategy,
     LFUStrategy,
     LRUStrategy,
     MRUStrategy,
+    ValueAwareAdaptiveLFUStrategy,
+    ValueAwareLRUStrategy,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
@@ -234,9 +237,17 @@ class RadixCache(BasePrefixCache):
             self.eviction_strategy: EvictionStrategy = MRUStrategy()
         elif eviction_policy.lower() == "filo":
             self.eviction_strategy: EvictionStrategy = FILOStrategy()
+        elif eviction_policy.lower() == "value_aware_lru":
+            self.eviction_strategy: EvictionStrategy = ValueAwareLRUStrategy()
+        elif eviction_policy.lower() == "adaptive_lfu":
+            self.eviction_strategy: EvictionStrategy = AdaptiveLFUStrategy()
+        elif eviction_policy.lower() == "value_aware_adaptive_lfu":
+            self.eviction_strategy: EvictionStrategy = ValueAwareAdaptiveLFUStrategy()
         else:
             raise ValueError(
-                f"Unknown eviction policy: {eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo'."
+                f"Unknown eviction policy: {eviction_policy}. Supported policies: "
+                f"'lru', 'lfu', 'fifo', 'mru', 'filo', 'value_aware_lru', "
+                f"'adaptive_lfu', 'value_aware_adaptive_lfu'."
             )
         self.reset()
 
