@@ -731,7 +731,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )
-            last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
+            # Optimized: Only convert dtype if necessary to avoid redundant operations
+            if last_recurrent_state.dtype != ssm_states.dtype:
+                last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             ssm_states[cache_indices] = last_recurrent_state
 
         return core_attn_out
@@ -987,12 +989,15 @@ class HybridLinearAttnBackend(AttentionBackend):
         valid_state_indices = state_indices_tensor[valid_mask].to(torch.int64)  # [N]
         last_steps = accepted_indices[valid_mask].to(torch.int64)  # [N]
 
+        # Optimized: Avoid dtype conversion if already matching to reduce overhead
         # scatter into ssm_states at the chosen cache lines
-        ssm_states[:, valid_state_indices, :] = intermediate_state_cache[
-            :, valid_state_indices, last_steps
-        ].to(ssm_states.dtype, copy=False)
+        intermediate_ssm = intermediate_state_cache[:, valid_state_indices, last_steps]
+        if intermediate_ssm.dtype != ssm_states.dtype:
+            intermediate_ssm = intermediate_ssm.to(ssm_states.dtype, copy=False)
+        ssm_states[:, valid_state_indices, :] = intermediate_ssm
 
         # Scatter into conv_states at the chosen cache lines
-        conv_states[:, valid_state_indices, :, :] = intermediate_conv_window_cache[
-            :, valid_state_indices, last_steps
-        ].to(conv_states.dtype, copy=False)
+        intermediate_conv = intermediate_conv_window_cache[:, valid_state_indices, last_steps]
+        if intermediate_conv.dtype != conv_states.dtype:
+            intermediate_conv = intermediate_conv.to(conv_states.dtype, copy=False)
+        conv_states[:, valid_state_indices, :, :] = intermediate_conv

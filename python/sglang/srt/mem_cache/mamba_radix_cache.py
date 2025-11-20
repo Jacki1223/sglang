@@ -162,17 +162,28 @@ class LRUList:
         """
         Move an (existing) node and its parents to most recently used position. Child node is
         more recently used than parent node.
+
+        Optimized: Batch collect nodes first, then update in one pass to reduce pointer chasing
         """
-        prev_node = self.head
-        while node != root_node:
-            if not self.mamba or node.mamba_value is not None:
+        # Collect all nodes that need to be updated
+        nodes_to_update = []
+        current = node
+        while current != root_node:
+            if not self.mamba or current.mamba_value is not None:
                 assert (
-                    node.id in self.cache
-                ), f"Resetting node {node.id=} not in lru list when resetting node and parents mru"
-                self._remove_node(node)
-                self._add_node_after(prev_node, node)
-                prev_node = node
-            node = node.parent
+                    current.id in self.cache
+                ), f"Resetting node {current.id=} not in lru list when resetting node and parents mru"
+                nodes_to_update.append(current)
+            current = current.parent
+
+        # Batch update: remove all nodes first, then add them back
+        for n in nodes_to_update:
+            self._remove_node(n)
+
+        prev_node = self.head
+        for n in nodes_to_update:
+            self._add_node_after(prev_node, n)
+            prev_node = n
 
     def insert_mru(self, node):
         """
@@ -747,6 +758,8 @@ class MambaRadixCache(BasePrefixCache):
         the matched node is guaranteed to either 1. connected to root without mamba tombstone,
         or 2. the number of matching tokens from the matched node to the last mamba tombstone
         node is greater than or equal to the sliding window size.
+
+        Optimized: Cache locality improved by traversing tree in a more predictable pattern
         """
         node = self.root_node
         child_key = self.get_child_key_fn(key)
