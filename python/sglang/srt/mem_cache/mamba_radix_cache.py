@@ -690,20 +690,35 @@ class MambaRadixCache(BasePrefixCache):
                 self.req_to_token_pool.mamba_pool.free(new_mamba_idx)
                 return None
 
-            # Update target node - only assign mamba_value, don't modify LRU lists
-            # The LRU list will be updated by the caller (e.g., cache_unfinished_req)
+            # Before assigning new mamba_value, check if target_node already has one
+            # (This shouldn't happen for tombstones, but handle it to prevent memory leak)
+            if target_node.mamba_value is not None:
+                logger.warning(
+                    f"Target node {target_node.id} already has mamba_value "
+                    f"(unexpected for tombstone). Freeing old mamba state "
+                    f"{target_node.mamba_value[0].item()} before assigning new one."
+                )
+                # Remove from LRU list if present
+                if target_node.id in self.mamba_lru_list.cache:
+                    self.mamba_lru_list.remove_node(target_node)
+                    self.mamba_evictable_size_ -= 1
+                # Free old mamba state to prevent memory leak
+                self.req_to_token_pool.mamba_pool.free(target_node.mamba_value)
+
+            # Update target node - assign new mamba_value
             target_node.mamba_value = new_mamba_idx
 
-            # Check if node is already in mamba_lru_list
+            # Insert into mamba_lru_list
+            # (We already removed it above if it was present, so it should not be in list)
             if target_node.id in self.mamba_lru_list.cache:
-                # Node already in list (shouldn't happen for tombstones, but be safe)
-                logger.warning(
-                    f"Recomputed node {target_node.id} already in mamba_lru_list, "
-                    f"will reset to MRU"
+                # This should not happen - if we reach here, there's a bug
+                logger.error(
+                    f"BUG: Recomputed node {target_node.id} still in mamba_lru_list "
+                    f"after cleanup. This indicates a logic error."
                 )
                 self.mamba_lru_list.reset_node_mru(target_node)
             else:
-                # Insert as new node
+                # Normal case: insert as new node
                 self.mamba_lru_list.insert_mru(target_node)
                 self.mamba_evictable_size_ += 1
 
