@@ -239,6 +239,10 @@ class RadixCacheCpp(BasePrefixCache):
             self.dec_lock_ref(req.last_node)
             self.inc_lock_ref(new_last_node)
 
+        # Update last_matched_prefix_len and cached_tokens to reflect the actual cached length
+        req.last_matched_prefix_len = len(new_indices)
+        req.cached_tokens = len(new_indices)
+
         # NOTE: there might be unaligned tail, so we may need to append it
         assert len(new_indices) <= prefill_len < len(new_indices) + self.page_size
         if self.page_size != 1 and len(new_indices) < prefill_len:

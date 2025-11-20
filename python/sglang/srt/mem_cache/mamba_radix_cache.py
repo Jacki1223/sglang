@@ -540,6 +540,10 @@ class MambaRadixCache(BasePrefixCache):
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
 
+        # Update last_matched_prefix_len and cached_tokens to reflect the actual cached length
+        req.last_matched_prefix_len = len(new_indices)
+        req.cached_tokens = len(new_indices)
+
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = new_indices
         req.last_node = new_last_node
