@@ -776,6 +776,7 @@ class Req:
                 ),
             )
             self.last_matched_prefix_len = len(self.prefix_indices)
+            self.cached_tokens = self.last_matched_prefix_len
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313

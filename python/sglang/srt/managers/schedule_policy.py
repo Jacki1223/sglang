@@ -185,6 +185,7 @@ class SchedulePolicy:
                     rid=r.rid, key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
                 )
             )
+            r.cached_tokens = len(r.prefix_indices)
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from
@@ -604,6 +605,7 @@ class PrefillAdder:
                 req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
                 prefix_len = len(req.prefix_indices)
                 req.last_matched_prefix_len = prefix_len
+                req.cached_tokens = prefix_len
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
