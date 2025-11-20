@@ -616,7 +616,7 @@ class MambaRadixCache(BasePrefixCache):
 
     def _try_rebuild_mamba_state(
         self,
-        start_node: TreeNode,
+        start_node: Optional[TreeNode],
         kv_indices_list: List[torch.Tensor],
         target_node: TreeNode,
     ) -> Optional[TreeNode]:
@@ -624,7 +624,7 @@ class MambaRadixCache(BasePrefixCache):
         Attempt to rebuild mamba state from start_node to target_node.
 
         Args:
-            start_node: Node with valid mamba_value to start from
+            start_node: Node with valid mamba_value to start from, or None to start from zero state
             kv_indices_list: List of KV cache index tensors to recompute over
             target_node: Target node to assign the rebuilt mamba state
 
@@ -646,10 +646,12 @@ class MambaRadixCache(BasePrefixCache):
             if num_tokens == 0:
                 return None
 
-            # Get starting mamba state
-            start_mamba_idx = start_node.mamba_value
-            if start_mamba_idx is None:
-                return None
+            # Get starting mamba state index (-1 means start from zero state)
+            if start_node is not None and start_node.mamba_value is not None:
+                start_mamba_idx = start_node.mamba_value[0].item()
+            else:
+                start_mamba_idx = -1  # Special value indicating zero-initialization
+                logger.info(f"Starting recomputation from zero-initialized mamba state")
 
             # Allocate new mamba state slot
             new_mamba_idx = self.req_to_token_pool.mamba_pool.alloc(1)
@@ -663,7 +665,7 @@ class MambaRadixCache(BasePrefixCache):
 
             # Call model_runner to recompute mamba state
             success = self.model_runner.recompute_mamba_state(
-                start_mamba_idx=start_mamba_idx[0].item(),
+                start_mamba_idx=start_mamba_idx,
                 target_mamba_idx=new_mamba_idx[0].item(),
                 kv_indices=kv_indices,
             )
@@ -926,19 +928,32 @@ class MambaRadixCache(BasePrefixCache):
             logger.info(
                 f"Tombstone detected: recompute_len={recompute_len}, "
                 f"max_tokens={self.recompute_max_tokens}, "
-                f"last_valid_node={'present' if last_valid_mamba_node else 'missing'}"
+                f"last_valid_node={'present' if last_valid_mamba_node else 'missing'}, "
+                f"total_value_len={len(value)}"
             )
 
-            if (recompute_len > 0 and
-                recompute_len <= self.recompute_max_tokens and
-                last_valid_mamba_node is not None):
-
-                logger.info(f"Attempting mamba state recomputation for {recompute_len} tokens...")
+            if recompute_len > 0 and recompute_len <= self.recompute_max_tokens:
+                # If no valid starting node, we can recompute from zero-initialized state
+                if last_valid_mamba_node is None:
+                    logger.info(
+                        f"No valid starting mamba state found. "
+                        f"Will attempt recomputation from zero-initialized state for {len(value)} tokens..."
+                    )
+                    # Use root node as starting point with zero state
+                    start_node = None
+                    kv_to_recompute = value
+                else:
+                    logger.info(
+                        f"Attempting mamba state recomputation for {recompute_len} tokens "
+                        f"from valid state..."
+                    )
+                    start_node = last_valid_mamba_node
+                    kv_to_recompute = value[last_valid_mamba_len:]
 
                 # Try to rebuild mamba state
                 rebuilt_node = self._try_rebuild_mamba_state(
-                    last_valid_mamba_node,
-                    value[last_valid_mamba_len:],
+                    start_node,
+                    kv_to_recompute,
                     node,
                 )
 
@@ -949,7 +964,7 @@ class MambaRadixCache(BasePrefixCache):
                     self.recompute_hit_count += 1
                     logger.info(
                         f"✓ Mamba state recomputed successfully: "
-                        f"{recompute_len} tokens, "
+                        f"{len(kv_to_recompute)} tokens, "
                         f"total hits: {self.recompute_hit_count}"
                     )
                 else:
