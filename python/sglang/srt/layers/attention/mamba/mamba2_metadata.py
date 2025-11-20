@@ -146,6 +146,8 @@ class Mamba2Metadata(ForwardMetadata):
         seq_lens: torch.Tensor,
     ) -> "Mamba2Metadata":
         """This path is run during CUDA graph capture, i.e. decode only, so `num_prefills` is 0"""
+        # Ensure state indices tensor is contiguous for better performance (vLLM PR #28176)
+        mamba_cache_indices = mamba_cache_indices.contiguous()
         return Mamba2Metadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=mamba_cache_indices,
@@ -163,6 +165,8 @@ class Mamba2Metadata(ForwardMetadata):
         forward_batch: ForwardBatch,
     ) -> "Mamba2Metadata":
         """This path cannot run with CUDA graph, as it contains extend requests."""
+        # Ensure state indices tensor is contiguous for better performance (vLLM PR #28176)
+        mamba_cache_indices = mamba_cache_indices.contiguous()
         if forward_batch.extend_num_tokens is None:
             return cls.prepare_decode(
                 query_start_loc, mamba_cache_indices, forward_batch.seq_lens
