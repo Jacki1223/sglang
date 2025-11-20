@@ -206,6 +206,7 @@ class Qwen3NextConfig(PretrainedConfig):
         router_aux_loss_coef=0.001,
         mlp_only_layers=[],
         layer_types=None,
+        full_attention_interval=4,
         **kwargs,
     ):
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
@@ -234,6 +235,9 @@ class Qwen3NextConfig(PretrainedConfig):
         self.linear_value_head_dim = linear_value_head_dim
         self.linear_num_key_heads = linear_num_key_heads
         self.linear_num_value_heads = linear_num_value_heads
+
+        # Hybrid attention configuration
+        self.full_attention_interval = full_attention_interval
 
         # MoE arguments
         self.decoder_sparse_step = decoder_sparse_step
