@@ -557,7 +557,22 @@ class MambaRadixCache(BasePrefixCache):
         )
 
         if not mamba_exist:
-            assert torch.equal(new_last_node.mamba_value, mamba_value_forked)
+            # If recomputation was enabled, new_last_node might have a recomputed mamba_value
+            # that differs from mamba_value_forked, so we need to handle both cases
+            if self.enable_recomputation and new_last_node.mamba_value is not None:
+                # Recomputation may have assigned a different mamba state
+                # Free the forked mamba value since we're using the recomputed one
+                if not torch.equal(new_last_node.mamba_value, mamba_value_forked):
+                    logger.debug(
+                        f"Using recomputed mamba state instead of forked state. "
+                        f"Freeing forked mamba_value={mamba_value_forked[0].item()}"
+                    )
+                    self.req_to_token_pool.mamba_pool.free(mamba_value_forked)
+                    # Update to use the recomputed value
+                    mamba_value_forked = new_last_node.mamba_value
+            else:
+                # Normal case: new_last_node.mamba_value should equal mamba_value_forked
+                assert torch.equal(new_last_node.mamba_value, mamba_value_forked)
 
         assert len(req.prefix_indices) <= len(
             new_indices
@@ -675,10 +690,22 @@ class MambaRadixCache(BasePrefixCache):
                 self.req_to_token_pool.mamba_pool.free(new_mamba_idx)
                 return None
 
-            # Update target node
+            # Update target node - only assign mamba_value, don't modify LRU lists
+            # The LRU list will be updated by the caller (e.g., cache_unfinished_req)
             target_node.mamba_value = new_mamba_idx
-            self.mamba_lru_list.insert_mru(target_node)
-            self.mamba_evictable_size_ += 1
+
+            # Check if node is already in mamba_lru_list
+            if target_node.id in self.mamba_lru_list.cache:
+                # Node already in list (shouldn't happen for tombstones, but be safe)
+                logger.warning(
+                    f"Recomputed node {target_node.id} already in mamba_lru_list, "
+                    f"will reset to MRU"
+                )
+                self.mamba_lru_list.reset_node_mru(target_node)
+            else:
+                # Insert as new node
+                self.mamba_lru_list.insert_mru(target_node)
+                self.mamba_evictable_size_ += 1
 
             return target_node
 
