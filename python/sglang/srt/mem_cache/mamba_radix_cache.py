@@ -361,12 +361,20 @@ class MambaRadixCache(BasePrefixCache):
         self.recompute_miss_count = 0
         self.recompute_skip_count = 0
 
-        if enable_recomputation and model_runner is None:
-            logger.warning(
-                "Mamba state recomputation is enabled but model_runner is not provided. "
-                "Recomputation will be disabled."
-            )
-            self.enable_recomputation = False
+        if enable_recomputation:
+            if model_runner is None:
+                logger.warning(
+                    "Mamba state recomputation is enabled but model_runner is not provided. "
+                    "Recomputation will be disabled."
+                )
+                self.enable_recomputation = False
+            else:
+                logger.info(
+                    f"MambaRadixCache: Recomputation ENABLED "
+                    f"(max_tokens={recompute_max_tokens}, "
+                    f"prioritize_mamba={prioritize_mamba_retention}, "
+                    f"eviction_threshold={mamba_eviction_threshold})"
+                )
 
         self.key_match_fn = _key_match_page_size1
         self.get_child_key_fn = get_child_key
@@ -624,6 +632,7 @@ class MambaRadixCache(BasePrefixCache):
             target_node if successful, None otherwise
         """
         if self.model_runner is None:
+            logger.warning("Cannot rebuild mamba state: model_runner is None")
             return None
 
         try:
@@ -914,9 +923,17 @@ class MambaRadixCache(BasePrefixCache):
         if self.enable_recomputation and tombstone_encountered:
             recompute_len = len(value) - last_valid_mamba_len
 
+            logger.info(
+                f"Tombstone detected: recompute_len={recompute_len}, "
+                f"max_tokens={self.recompute_max_tokens}, "
+                f"last_valid_node={'present' if last_valid_mamba_node else 'missing'}"
+            )
+
             if (recompute_len > 0 and
                 recompute_len <= self.recompute_max_tokens and
                 last_valid_mamba_node is not None):
+
+                logger.info(f"Attempting mamba state recomputation for {recompute_len} tokens...")
 
                 # Try to rebuild mamba state
                 rebuilt_node = self._try_rebuild_mamba_state(
@@ -930,15 +947,23 @@ class MambaRadixCache(BasePrefixCache):
                     best_value_len = len(value)
                     best_last_node = rebuilt_node
                     self.recompute_hit_count += 1
-                    logger.debug(
-                        f"Mamba state recomputed successfully: "
+                    logger.info(
+                        f"✓ Mamba state recomputed successfully: "
                         f"{recompute_len} tokens, "
                         f"total hits: {self.recompute_hit_count}"
                     )
                 else:
                     self.recompute_miss_count += 1
+                    logger.warning(
+                        f"✗ Mamba state recomputation failed "
+                        f"(misses: {self.recompute_miss_count})"
+                    )
             elif recompute_len > self.recompute_max_tokens:
                 self.recompute_skip_count += 1
+                logger.info(
+                    f"Skipping recomputation: {recompute_len} > {self.recompute_max_tokens} "
+                    f"(skips: {self.recompute_skip_count})"
+                )
 
         # Update LRU lists
         node_update = best_last_node

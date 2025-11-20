@@ -779,7 +779,7 @@ class Scheduler(
                     recompute_max_tokens=server_args.mamba_recompute_max_tokens,
                     prioritize_mamba_retention=server_args.prioritize_mamba_retention,
                     mamba_eviction_threshold=server_args.mamba_eviction_threshold,
-                    model_runner=None,  # Will be set later after model_runner is available
+                    model_runner=self.tp_worker.model_runner,
                 )
             elif server_args.enable_lmcache:
                 from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
