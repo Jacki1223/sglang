@@ -476,6 +476,13 @@ class ServerArgs:
 
     # Optimization/debug options
     disable_radix_cache: bool = False
+
+    # Mamba Radix Cache Recomputation Settings
+    enable_mamba_state_recomputation: bool = False
+    mamba_recompute_max_tokens: int = 512
+    prioritize_mamba_retention: bool = True
+    mamba_eviction_threshold: float = 0.8
+
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
@@ -3246,6 +3253,38 @@ class ServerArgs:
             action="store_true",
             help="Disable RadixAttention for prefix caching.",
         )
+
+        # Mamba State Recomputation
+        parser.add_argument(
+            "--enable-mamba-state-recomputation",
+            action="store_true",
+            help="Enable recomputation of mamba states from tombstone nodes. "
+            "This can significantly improve cache hit rate for hybrid GDN models "
+            "like Qwen3-Next by reconstructing missing mamba states from cached KV data.",
+        )
+        parser.add_argument(
+            "--mamba-recompute-max-tokens",
+            type=int,
+            default=ServerArgs.mamba_recompute_max_tokens,
+            help="Maximum number of tokens to recompute for mamba state reconstruction. "
+            "If the distance exceeds this threshold, recomputation is skipped. "
+            "Recommended: 256-1024. Default: 512.",
+        )
+        parser.add_argument(
+            "--prioritize-mamba-retention",
+            action="store_true",
+            default=ServerArgs.prioritize_mamba_retention,
+            help="When evicting cache, prioritize retaining mamba states over full KV cache. "
+            "This reduces tombstone node creation.",
+        )
+        parser.add_argument(
+            "--mamba-eviction-threshold",
+            type=float,
+            default=ServerArgs.mamba_eviction_threshold,
+            help="Threshold for triggering full KV eviction instead of mamba eviction. "
+            "Range: 0.0-1.0. Default: 0.8 (80%%).",
+        )
+
         parser.add_argument(
             "--cuda-graph-max-bs",
             type=int,

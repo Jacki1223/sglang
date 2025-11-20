@@ -327,6 +327,11 @@ class MambaRadixCache(BasePrefixCache):
         page_size: int,
         disable: bool = False,
         enable_metrics: bool = False,
+        enable_recomputation: bool = False,
+        recompute_max_tokens: int = 512,
+        prioritize_mamba_retention: bool = True,
+        mamba_eviction_threshold: float = 0.8,
+        model_runner=None,
     ):
         assert isinstance(token_to_kv_pool_allocator, TokenToKVPoolAllocator)
         self.req_to_token_pool = req_to_token_pool
@@ -343,6 +348,25 @@ class MambaRadixCache(BasePrefixCache):
 
         if enable_metrics:
             self.init_metrics_collector()
+
+        # Mamba state recomputation settings
+        self.enable_recomputation = enable_recomputation
+        self.recompute_max_tokens = recompute_max_tokens
+        self.prioritize_mamba_retention = prioritize_mamba_retention
+        self.mamba_eviction_threshold = mamba_eviction_threshold
+        self.model_runner = model_runner
+
+        # Statistics
+        self.recompute_hit_count = 0
+        self.recompute_miss_count = 0
+        self.recompute_skip_count = 0
+
+        if enable_recomputation and model_runner is None:
+            logger.warning(
+                "Mamba state recomputation is enabled but model_runner is not provided. "
+                "Recomputation will be disabled."
+            )
+            self.enable_recomputation = False
 
         self.key_match_fn = _key_match_page_size1
         self.get_child_key_fn = get_child_key
@@ -582,9 +606,101 @@ class MambaRadixCache(BasePrefixCache):
         full_num_evicted += leaf_full_num_evicted
         return full_num_evicted, mamba_num_evicted, x, x_next
 
+    def _try_rebuild_mamba_state(
+        self,
+        start_node: TreeNode,
+        kv_indices_list: List[torch.Tensor],
+        target_node: TreeNode,
+    ) -> Optional[TreeNode]:
+        """
+        Attempt to rebuild mamba state from start_node to target_node.
+
+        Args:
+            start_node: Node with valid mamba_value to start from
+            kv_indices_list: List of KV cache index tensors to recompute over
+            target_node: Target node to assign the rebuilt mamba state
+
+        Returns:
+            target_node if successful, None otherwise
+        """
+        if self.model_runner is None:
+            return None
+
+        try:
+            # Concatenate all KV indices
+            if not kv_indices_list:
+                return None
+
+            kv_indices = torch.cat(kv_indices_list)
+            num_tokens = len(kv_indices)
+
+            if num_tokens == 0:
+                return None
+
+            # Get starting mamba state
+            start_mamba_idx = start_node.mamba_value
+            if start_mamba_idx is None:
+                return None
+
+            # Allocate new mamba state slot
+            new_mamba_idx = self.req_to_token_pool.mamba_pool.alloc(1)
+            if new_mamba_idx is None:
+                # Try evicting and allocate again
+                self.evict_mamba(1)
+                new_mamba_idx = self.req_to_token_pool.mamba_pool.alloc(1)
+                if new_mamba_idx is None:
+                    logger.warning("Failed to allocate mamba state for recomputation")
+                    return None
+
+            # Call model_runner to recompute mamba state
+            success = self.model_runner.recompute_mamba_state(
+                start_mamba_idx=start_mamba_idx[0].item(),
+                target_mamba_idx=new_mamba_idx[0].item(),
+                kv_indices=kv_indices,
+            )
+
+            if not success:
+                # Recomputation failed, free the allocated slot
+                self.req_to_token_pool.mamba_pool.free(new_mamba_idx)
+                return None
+
+            # Update target node
+            target_node.mamba_value = new_mamba_idx
+            self.mamba_lru_list.insert_mru(target_node)
+            self.mamba_evictable_size_ += 1
+
+            return target_node
+
+        except Exception as e:
+            logger.warning(f"Mamba state recomputation failed with error: {e}")
+            return None
+
     def evict_mamba(self, mamba_num: int) -> None:
         if self.disable or mamba_num <= 0:
             return
+
+        # Prioritize mamba retention strategy
+        if self.prioritize_mamba_retention:
+            mamba_total = self.mamba_evictable_size_ + self.mamba_protected_size_
+            if mamba_total > 0:
+                mamba_usage = self.mamba_protected_size_ / mamba_total
+
+                # If mamba usage is below threshold, try evicting full KV first
+                if mamba_usage < self.mamba_eviction_threshold:
+                    # Heuristic: 1 mamba state ≈ 10 full KV tokens
+                    full_tokens_to_evict = mamba_num * 10
+
+                    logger.debug(
+                        f"Mamba usage {mamba_usage:.2%} < threshold {self.mamba_eviction_threshold:.2%}, "
+                        f"evicting {full_tokens_to_evict} full KV tokens first"
+                    )
+
+                    self.evict(full_tokens_to_evict)
+
+                    # Check if we now have enough space
+                    if self.req_to_token_pool.mamba_pool.available_size() >= mamba_num:
+                        return
+
         # get the least recently used node that is not locked, doesn't have to be a leaf
         x = self.mamba_lru_list.get_lru_no_lock()
         mamba_num_evicted = 0
@@ -743,10 +859,11 @@ class MambaRadixCache(BasePrefixCache):
         self, key: RadixKey
     ) -> Tuple[List[torch.Tensor], TreeNode]:
         """
-        Mamba prefix matching helper. It factors in the sliding window size such that
-        the matched node is guaranteed to either 1. connected to root without mamba tombstone,
-        or 2. the number of matching tokens from the matched node to the last mamba tombstone
-        node is greater than or equal to the sliding window size.
+        Enhanced Mamba prefix matching with state recomputation support.
+
+        When encountering tombstone nodes (nodes with full KV but no mamba state),
+        this method can optionally recompute the mamba state from the nearest
+        valid mamba state node.
         """
         node = self.root_node
         child_key = self.get_child_key_fn(key)
@@ -754,12 +871,25 @@ class MambaRadixCache(BasePrefixCache):
         value = []
         best_value_len = 0
         best_last_node = node
+
+        # Track tombstone path for potential recomputation
+        last_valid_mamba_node = None
+        last_valid_mamba_len = 0
+        tombstone_encountered = False
+
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
-            # update best_value_len and best_last_node if needed
+
+            # Check if current node has valid mamba state
             if node.mamba_value is not None:
                 best_value_len = len(value)
                 best_last_node = node
+                last_valid_mamba_node = node
+                last_valid_mamba_len = len(value)
+                tombstone_encountered = False  # Reset tombstone tracking
+            elif node != self.root_node and not tombstone_encountered:
+                # First tombstone node encountered
+                tombstone_encountered = True
 
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
@@ -774,24 +904,52 @@ class MambaRadixCache(BasePrefixCache):
 
                 if len(key):
                     child_key = self.get_child_key_fn(key)
-        # handle best_value_len and best_last_node, for the case that last node is fully matched
+
+        # Check the final node
         if node.mamba_value is not None:
             best_value_len = len(value)
             best_last_node = node
 
-        # update time for matched nodes, and make nodes closer to root to be least recently used
-        # this allows mamba to evict nodes closer to root first
+        # Attempt recomputation if enabled and tombstone was encountered
+        if self.enable_recomputation and tombstone_encountered:
+            recompute_len = len(value) - last_valid_mamba_len
+
+            if (recompute_len > 0 and
+                recompute_len <= self.recompute_max_tokens and
+                last_valid_mamba_node is not None):
+
+                # Try to rebuild mamba state
+                rebuilt_node = self._try_rebuild_mamba_state(
+                    last_valid_mamba_node,
+                    value[last_valid_mamba_len:],
+                    node,
+                )
+
+                if rebuilt_node is not None:
+                    # Recomputation successful!
+                    best_value_len = len(value)
+                    best_last_node = rebuilt_node
+                    self.recompute_hit_count += 1
+                    logger.debug(
+                        f"Mamba state recomputed successfully: "
+                        f"{recompute_len} tokens, "
+                        f"total hits: {self.recompute_hit_count}"
+                    )
+                else:
+                    self.recompute_miss_count += 1
+            elif recompute_len > self.recompute_max_tokens:
+                self.recompute_skip_count += 1
+
+        # Update LRU lists
         node_update = best_last_node
         self.full_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
         self.mamba_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
 
-        # This last_access_time is for sanity check, can be deleted after validation in production
+        # Update last access time for sanity check
         cur_time = get_last_access_time()
         while node_update:
             node_update.last_access_time = cur_time
-            cur_time -= (
-                0.00001  # assuming less than 100000 nodes in a branch of the tree
-            )
+            cur_time -= 0.00001
             node_update = node_update.parent
 
         return value[:best_value_len], best_last_node
@@ -1012,3 +1170,25 @@ class MambaRadixCache(BasePrefixCache):
                     continue
                 stack.append(child)
         return total_size, total_mamba_size
+
+    def get_recomputation_stats(self) -> Dict[str, any]:
+        """Get statistics about mamba state recomputation"""
+        total_attempts = self.recompute_hit_count + self.recompute_miss_count
+        hit_rate = (
+            self.recompute_hit_count / total_attempts
+            if total_attempts > 0
+            else 0.0
+        )
+        return {
+            "recompute_hit_count": self.recompute_hit_count,
+            "recompute_miss_count": self.recompute_miss_count,
+            "recompute_skip_count": self.recompute_skip_count,
+            "total_attempts": total_attempts,
+            "hit_rate": hit_rate,
+        }
+
+    def reset_recomputation_stats(self):
+        """Reset recomputation statistics"""
+        self.recompute_hit_count = 0
+        self.recompute_miss_count = 0
+        self.recompute_skip_count = 0

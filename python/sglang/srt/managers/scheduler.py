@@ -775,6 +775,11 @@ class Scheduler(
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
                     enable_metrics=self.enable_metrics,
+                    enable_recomputation=server_args.enable_mamba_state_recomputation,
+                    recompute_max_tokens=server_args.mamba_recompute_max_tokens,
+                    prioritize_mamba_retention=server_args.prioritize_mamba_retention,
+                    mamba_eviction_threshold=server_args.mamba_eviction_threshold,
+                    model_runner=None,  # Will be set later after model_runner is available
                 )
             elif server_args.enable_lmcache:
                 from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
