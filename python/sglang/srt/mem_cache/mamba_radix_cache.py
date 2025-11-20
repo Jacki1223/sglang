@@ -650,6 +650,15 @@ class MambaRadixCache(BasePrefixCache):
             logger.warning("Cannot rebuild mamba state: model_runner is None")
             return None
 
+        # Check if target_node already has mamba_value (from concurrent recomputation)
+        # If yes, just use it instead of recomputing again
+        if target_node.mamba_value is not None:
+            logger.debug(
+                f"Target node {target_node.id} already has mamba_value={target_node.mamba_value[0].item()}. "
+                f"Skipping recomputation (likely computed by concurrent request)."
+            )
+            return target_node
+
         try:
             # Concatenate all KV indices
             if not kv_indices_list:
@@ -967,14 +976,25 @@ class MambaRadixCache(BasePrefixCache):
         if self.enable_recomputation and tombstone_encountered:
             recompute_len = len(value) - last_valid_mamba_len
 
-            logger.info(
+            logger.debug(
                 f"Tombstone detected: recompute_len={recompute_len}, "
                 f"max_tokens={self.recompute_max_tokens}, "
                 f"last_valid_node={'present' if last_valid_mamba_node else 'missing'}, "
-                f"total_value_len={len(value)}"
+                f"total_value_len={len(value)}, "
+                f"final_node_has_mamba={'yes' if node.mamba_value is not None else 'no'}"
             )
 
-            if recompute_len > 0 and recompute_len <= self.recompute_max_tokens:
+            # Check if the final node already has mamba_value (e.g., from concurrent recomputation)
+            if node.mamba_value is not None:
+                # Node was already recomputed by another concurrent request
+                # Use the existing mamba state instead of recomputing again
+                logger.debug(
+                    f"Final node {node.id} already has mamba_value "
+                    f"(likely from concurrent recomputation). Using existing state."
+                )
+                best_value_len = len(value)
+                best_last_node = node
+            elif recompute_len > 0 and recompute_len <= self.recompute_max_tokens:
                 # If no valid starting node, we can recompute from zero-initialized state
                 if last_valid_mamba_node is None:
                     logger.info(
@@ -1017,7 +1037,7 @@ class MambaRadixCache(BasePrefixCache):
                     )
             elif recompute_len > self.recompute_max_tokens:
                 self.recompute_skip_count += 1
-                logger.info(
+                logger.debug(
                     f"Skipping recomputation: {recompute_len} > {self.recompute_max_tokens} "
                     f"(skips: {self.recompute_skip_count})"
                 )
