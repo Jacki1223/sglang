@@ -127,21 +127,20 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Apply softplus with numerical stability
         softplus_x = tl.where(
             beta_x <= softplus_threshold,
-            (1.0 / softplus_beta) * tl.log1p(tl.exp(beta_x)),  # Use log1p for better numerical stability
+            (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
             x,
         )
         b_g = neg_exp_A * softplus_x
 
         # Compute beta = sigmoid(b) using fast sigmoid approximation
-        # sigmoid(x) = 1 / (1 + exp(-x)) = exp(x) / (exp(x) + 1)
         # Use tl.sigmoid for potential hardware acceleration
         b_beta = tl.sigmoid(b_b)
 
         # Apply L2 normalization if enabled
         if USE_QK_L2NORM_IN_KERNEL:
             # Use rsqrt for faster reciprocal square root
-            q_norm = tl.math.rsqrt(tl.sum(b_q * b_q) + 1e-6)
-            k_norm = tl.math.rsqrt(tl.sum(b_k * b_k) + 1e-6)
+            q_norm = tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
+            k_norm = tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
             b_q = b_q * q_norm
             b_k = b_k * k_norm
 
