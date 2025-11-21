@@ -15,16 +15,14 @@ from sglang.srt.layers.attention.fla.utils import input_guard
 )
 @triton.autotune(
     configs=[
-        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=2),
-        triton.Config({"BK": 64, "BV": 32}, num_warps=4, num_stages=3),
-        triton.Config({"BK": 32, "BV": 64}, num_warps=4, num_stages=3),
-        triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=4),
-        triton.Config({"BK": 64, "BV": 16}, num_warps=2, num_stages=3),
-        triton.Config({"BK": 16, "BV": 64}, num_warps=2, num_stages=3),
-        triton.Config({"BK": 128, "BV": 32}, num_warps=8, num_stages=2),
-        triton.Config({"BK": 32, "BV": 128}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=2, num_stages=3),
+        triton.Config({}, num_warps=2, num_stages=4),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=3),
     ],
-    key=["K", "V", "H", "HV"],
+    key=["BK", "BV", "K", "V"],
 )
 @triton.jit(do_not_specialize=["T"])
 def fused_sigmoid_gating_delta_rule_update_kernel(
@@ -214,10 +212,9 @@ def fused_sigmoid_gating_delta_rule_update(
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
 
-    # Let autotune determine optimal BK and BV
-    # Use reasonable upper bounds for grid calculation
-    BK = min(triton.next_power_of_2(K), 128)
-    BV = min(triton.next_power_of_2(V), 128)
+    # Use larger block sizes for better performance
+    BK = triton.next_power_of_2(K)
+    BV = min(triton.next_power_of_2(V), 64)  # Increase from 8 to 64
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
 
@@ -229,7 +226,7 @@ def fused_sigmoid_gating_delta_rule_update(
     o = q.new_empty(NK, *v.shape)
     grid = (NK, NV, N * HV)
 
-    # Launch kernel - autotune will select optimal config
+    # Launch kernel - autotune will select optimal num_warps and num_stages
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
         a=a,
@@ -251,6 +248,8 @@ def fused_sigmoid_gating_delta_rule_update(
         HV=HV,
         K=K,
         V=V,
+        BK=BK,
+        BV=BV,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
     )
     o = o.squeeze(0)
