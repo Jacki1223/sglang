@@ -66,8 +66,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     # Gating computation pointers
     p_A_log = A_log + i_hv
     if IS_KDA:
-        p_a = a + (bos * HV + i_hv) * K + o_k
-        p_dt_bias = dt_bias + i_hv * K + o_k
+        p_a = a + (bos * HV + i_hv) * K
+        p_dt_bias = dt_bias + i_hv * K
     else:
         p_a = a + bos * HV + i_hv
         p_dt_bias = dt_bias + i_hv
@@ -76,82 +76,284 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     mask_v = o_v < V
     mask_h = mask_k[:, None] & mask_v[None, :]
 
-    b_h = tl.zeros([BK, BV], dtype=tl.float32)
-    if USE_INITIAL_STATE:
-        idx = tl.load(h0_indices + i_n)
-        if idx >= 0:
-            p_h0 = (
-                h0_source
-                + idx * HV * K * V
-                + i_hv * K * V
-                + o_k[:, None] * V
-                + o_v[None, :]
-            )
-            b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+    nk = tl.cdiv(K, BK)
+    inv_softplus_beta = 1.0 / softplus_beta
+    b_A_log = tl.load(p_A_log, cache_modifier=".ca").to(tl.float32)
+    exp_A_log = tl.exp(b_A_log)
+    if not IS_KDA:
+        b_dt_bias = tl.load(p_dt_bias, cache_modifier=".ca").to(tl.float32)
 
-    for _ in range(0, T):
-        # Load inputs
-        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
-        b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
-        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
-        b_b = tl.load(p_b).to(tl.float32)
-
-        # Compute sigmoid gating
-        # Load gating parameters
-        b_A_log = tl.load(p_A_log).to(tl.float32)
-        b_a = tl.load(p_a).to(tl.float32)
-        b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
-
-        # Compute g = -exp(A_log) * softplus(a + dt_bias)
-        x = b_a + b_dt_bias
-        beta_x = softplus_beta * x
-        # Apply softplus with numerical stability
-        softplus_x = tl.where(
-            beta_x <= softplus_threshold,
-            (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
-            x,
-        )
-        b_g = -tl.exp(b_A_log) * softplus_x
-
-        # Compute beta = sigmoid(b)
-        b_beta = 1.0 / (1.0 + tl.exp(-b_b))
-
-        # Apply L2 normalization if enabled
-        if USE_QK_L2NORM_IN_KERNEL:
-            b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
-            b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
-
-        b_q = b_q * scale
-
-        # Apply gating to hidden state: h *= exp(g)
+    if nk == 1:
         if IS_KDA:
-            b_h *= tl.exp(b_g[:, None])
+            b_dt_bias = tl.load(
+                p_dt_bias + o_k, mask=mask_k, other=0, cache_modifier=".ca"
+            ).to(tl.float32)
+        b_h = tl.zeros([BK, BV], dtype=tl.float32)
+        if USE_INITIAL_STATE:
+            idx = tl.load(h0_indices + i_n)
+            if idx >= 0:
+                p_h0 = (
+                    h0_source
+                    + idx * HV * K * V
+                    + i_hv * K * V
+                    + o_k[:, None] * V
+                    + o_v[None, :]
+                )
+                b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+
+        for _ in range(0, T):
+            # Load inputs
+            b_q = tl.load(p_q, mask=mask_k, other=0, cache_modifier=".cg").to(
+                tl.float32
+            )
+            b_k = tl.load(p_k, mask=mask_k, other=0, cache_modifier=".cg").to(
+                tl.float32
+            )
+            b_v = tl.load(p_v, mask=mask_v, other=0, cache_modifier=".cg").to(
+                tl.float32
+            )
+            b_b = tl.load(p_b, cache_modifier=".cg").to(tl.float32)
+
+            # Compute sigmoid gating
+            # Compute g = -exp(A_log) * softplus(a + dt_bias)
+            if IS_KDA:
+                b_a = tl.load(
+                    p_a + o_k, mask=mask_k, other=0, cache_modifier=".cg"
+                ).to(tl.float32)
+            else:
+                b_a = tl.load(p_a, cache_modifier=".cg").to(tl.float32)
+            x = b_a + b_dt_bias
+            beta_x = softplus_beta * x
+            # Apply softplus with numerical stability
+            softplus_x = tl.where(
+                beta_x <= softplus_threshold,
+                inv_softplus_beta * tl.log(1.0 + tl.exp(beta_x)),
+                x,
+            )
+            b_g = -exp_A_log * softplus_x
+
+            # Compute beta = sigmoid(b)
+            b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+
+            # Apply L2 normalization if enabled
+            if USE_QK_L2NORM_IN_KERNEL:
+                b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
+                b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
+
+            b_q = b_q * scale
+
+            # Apply gating to hidden state: h *= exp(g)
+            if IS_KDA:
+                b_h *= tl.exp(b_g[:, None])
+            else:
+                b_h *= tl.exp(b_g)
+
+            # Delta rule: v -= sum(h * k, dim=0)
+            b_v = tl.fma(-1.0, tl.sum(b_h * b_k[:, None], 0), b_v)
+
+            # Apply beta gating: v *= beta
+            b_v *= b_beta
+
+            # Update hidden state: h += k[:, None] * v[None, :]
+            b_h = tl.fma(b_k[:, None], b_v[None, :], b_h)
+
+            # Compute output: o = sum(h * q, dim=0)
+            b_o = tl.sum(b_h * b_q[:, None], 0)
+            tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+
+            # Update pointers for next timestep
+            p_q += H * K
+            p_k += H * K
+            p_o += HV * V
+            p_v += HV * V
+            p_b += HV
+            p_a += HV
+    else:
+        if USE_INITIAL_STATE:
+            idx = tl.load(h0_indices + i_n)
         else:
-            b_h *= tl.exp(b_g)
+            idx = -1
+        for _ in range(0, T):
+            b_v = tl.load(p_v, mask=mask_v, other=0, cache_modifier=".cg").to(
+                tl.float32
+            )
+            b_b = tl.load(p_b, cache_modifier=".cg").to(tl.float32)
 
-        # Delta rule: v -= sum(h * k, dim=0)
-        b_v -= tl.sum(b_h * b_k[:, None], 0)
+            if USE_QK_L2NORM_IN_KERNEL:
+                sum_q = 0.0
+                sum_k = 0.0
+                for k_block in range(0, nk):
+                    o_k_tile = k_block * BK + tl.arange(0, BK)
+                    mask_k_tile = o_k_tile < K
+                    b_q_tile = tl.load(
+                        p_q + o_k_tile,
+                        mask=mask_k_tile,
+                        other=0,
+                        cache_modifier=".cg",
+                    ).to(tl.float32)
+                    b_k_tile = tl.load(
+                        p_k + o_k_tile,
+                        mask=mask_k_tile,
+                        other=0,
+                        cache_modifier=".cg",
+                    ).to(tl.float32)
+                    sum_q += tl.sum(b_q_tile * b_q_tile, 0)
+                    sum_k += tl.sum(b_k_tile * b_k_tile, 0)
+                inv_norm_q = tl.rsqrt(sum_q + 1e-6)
+                inv_norm_k = tl.rsqrt(sum_k + 1e-6)
+            else:
+                inv_norm_q = 1.0
+                inv_norm_k = 1.0
 
-        # Apply beta gating: v *= beta
-        b_v *= b_beta
+            if IS_KDA:
+                b_g_scalar = None
+            else:
+                b_a = tl.load(p_a, cache_modifier=".cg").to(tl.float32)
+                x = b_a + b_dt_bias
+                beta_x = softplus_beta * x
+                softplus_x = tl.where(
+                    beta_x <= softplus_threshold,
+                    inv_softplus_beta * tl.log(1.0 + tl.exp(beta_x)),
+                    x,
+                )
+                b_g_scalar = -exp_A_log * softplus_x
 
-        # Update hidden state: h += k[:, None] * v[None, :]
-        b_h += b_k[:, None] * b_v[None, :]
+            b_beta = 1.0 / (1.0 + tl.exp(-b_b))
 
-        # Compute output: o = sum(h * q, dim=0)
-        b_o = tl.sum(b_h * b_q[:, None], 0)
-        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+            for k_block in range(0, nk):
+                o_k_tile = k_block * BK + tl.arange(0, BK)
+                mask_k_tile = o_k_tile < K
+                mask_h_tile = mask_k_tile[:, None] & mask_v[None, :]
+                b_k_tile = tl.load(
+                    p_k + o_k_tile,
+                    mask=mask_k_tile,
+                    other=0,
+                    cache_modifier=".cg",
+                ).to(tl.float32)
+                b_k_tile = b_k_tile * inv_norm_k
+                if USE_INITIAL_STATE and idx >= 0:
+                    p_h0 = (
+                        h0_source
+                        + idx * HV * K * V
+                        + i_hv * K * V
+                        + o_k_tile[:, None] * V
+                        + o_v[None, :]
+                    )
+                    b_h_tile = tl.load(
+                        p_h0, mask=mask_h_tile, other=0
+                    ).to(tl.float32)
+                else:
+                    b_h_tile = tl.zeros([BK, BV], dtype=tl.float32)
+                if IS_KDA:
+                    b_a_tile = tl.load(
+                        p_a + o_k_tile,
+                        mask=mask_k_tile,
+                        other=0,
+                        cache_modifier=".cg",
+                    ).to(tl.float32)
+                    b_dt_bias_tile = tl.load(
+                        p_dt_bias + o_k_tile,
+                        mask=mask_k_tile,
+                        other=0,
+                        cache_modifier=".ca",
+                    ).to(tl.float32)
+                    x = b_a_tile + b_dt_bias_tile
+                    beta_x = softplus_beta * x
+                    softplus_x = tl.where(
+                        beta_x <= softplus_threshold,
+                        inv_softplus_beta * tl.log(1.0 + tl.exp(beta_x)),
+                        x,
+                    )
+                    b_g_tile = -exp_A_log * softplus_x
+                    b_h_tile *= tl.exp(b_g_tile[:, None])
+                else:
+                    b_h_tile *= tl.exp(b_g_scalar)
+                b_v = tl.fma(-1.0, tl.sum(b_h_tile * b_k_tile[:, None], 0), b_v)
 
-        # Update pointers for next timestep
-        p_q += H * K
-        p_k += H * K
-        p_o += HV * V
-        p_v += HV * V
-        p_b += HV
-        p_a += HV
+            b_v *= b_beta
+
+            b_o = tl.zeros([BV], dtype=tl.float32)
+            for k_block in range(0, nk):
+                o_k_tile = k_block * BK + tl.arange(0, BK)
+                mask_k_tile = o_k_tile < K
+                mask_h_tile = mask_k_tile[:, None] & mask_v[None, :]
+                b_q_tile = tl.load(
+                    p_q + o_k_tile,
+                    mask=mask_k_tile,
+                    other=0,
+                    cache_modifier=".cg",
+                ).to(tl.float32)
+                b_k_tile = tl.load(
+                    p_k + o_k_tile,
+                    mask=mask_k_tile,
+                    other=0,
+                    cache_modifier=".cg",
+                ).to(tl.float32)
+                b_q_tile = b_q_tile * (scale * inv_norm_q)
+                b_k_tile = b_k_tile * inv_norm_k
+                if USE_INITIAL_STATE and idx >= 0:
+                    p_h0 = (
+                        h0_source
+                        + idx * HV * K * V
+                        + i_hv * K * V
+                        + o_k_tile[:, None] * V
+                        + o_v[None, :]
+                    )
+                    b_h_tile = tl.load(
+                        p_h0, mask=mask_h_tile, other=0
+                    ).to(tl.float32)
+                else:
+                    b_h_tile = tl.zeros([BK, BV], dtype=tl.float32)
+
+                if IS_KDA:
+                    b_a_tile = tl.load(
+                        p_a + o_k_tile,
+                        mask=mask_k_tile,
+                        other=0,
+                        cache_modifier=".cg",
+                    ).to(tl.float32)
+                    b_dt_bias_tile = tl.load(
+                        p_dt_bias + o_k_tile,
+                        mask=mask_k_tile,
+                        other=0,
+                        cache_modifier=".ca",
+                    ).to(tl.float32)
+                    x = b_a_tile + b_dt_bias_tile
+                    beta_x = softplus_beta * x
+                    softplus_x = tl.where(
+                        beta_x <= softplus_threshold,
+                        inv_softplus_beta * tl.log(1.0 + tl.exp(beta_x)),
+                        x,
+                    )
+                    b_g_tile = -exp_A_log * softplus_x
+                    b_h_tile *= tl.exp(b_g_tile[:, None])
+                else:
+                    b_h_tile *= tl.exp(b_g_scalar)
+                b_h_tile = tl.fma(b_k_tile[:, None], b_v[None, :], b_h_tile)
+                if USE_INITIAL_STATE and idx >= 0:
+                    p_h0 = (
+                        h0_source
+                        + idx * HV * K * V
+                        + i_hv * K * V
+                        + o_k_tile[:, None] * V
+                        + o_v[None, :]
+                    )
+                    tl.store(
+                        p_h0, b_h_tile.to(p_h0.dtype.element_ty), mask=mask_h_tile
+                    )
+                b_o += tl.sum(b_h_tile * b_q_tile[:, None], 0)
+
+            tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+
+            p_q += H * K
+            p_k += H * K
+            p_o += HV * V
+            p_v += HV * V
+            p_b += HV
+            p_a += HV
 
     # Store final state back to h0_source with bounds checking
-    if USE_INITIAL_STATE:
+    if nk == 1 and USE_INITIAL_STATE:
         idx = tl.load(h0_indices + i_n)
         if idx >= 0:
             p_h0 = (
@@ -190,9 +392,9 @@ def fused_sigmoid_gating_delta_rule_update(
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 8)
+    BK_MAX = 64
+    BK, BV = min(triton.next_power_of_2(K), BK_MAX), min(triton.next_power_of_2(V), 8)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
-    assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3
     num_warps = 1
 
@@ -201,8 +403,8 @@ def fused_sigmoid_gating_delta_rule_update(
     else:
         assert scale > 0, "scale must be positive"
 
-    o = q.new_empty(NK, *v.shape)
-    grid = (NK, NV, N * HV)
+    o = q.new_empty(1, *v.shape)
+    grid = (1, NV, N * HV)
 
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
