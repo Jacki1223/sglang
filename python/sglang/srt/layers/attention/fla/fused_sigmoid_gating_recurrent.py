@@ -76,18 +76,30 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     mask_v = o_v < V
     mask_h = mask_k[:, None] & mask_v[None, :]
 
+    # Cache h0_indices once to avoid redundant global memory load after the loop
+    h0_idx = -1
+    if USE_INITIAL_STATE:
+        h0_idx = tl.load(h0_indices + i_n)
+
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
-        idx = tl.load(h0_indices + i_n)
-        if idx >= 0:
+        if h0_idx >= 0:
             p_h0 = (
                 h0_source
-                + idx * HV * K * V
+                + h0_idx * HV * K * V
                 + i_hv * K * V
                 + o_k[:, None] * V
                 + o_v[None, :]
             )
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+
+    # Hoist loop-invariant loads: A_log and dt_bias are model parameters
+    # that remain constant across all timesteps
+    b_A_log = tl.load(p_A_log).to(tl.float32)
+    if IS_KDA:
+        b_dt_bias = tl.load(p_dt_bias, mask=mask_k, other=0).to(tl.float32)
+    else:
+        b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
 
     for _ in range(0, T):
         # Load inputs
@@ -96,11 +108,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
         b_b = tl.load(p_b).to(tl.float32)
 
-        # Compute sigmoid gating
-        # Load gating parameters
-        b_A_log = tl.load(p_A_log).to(tl.float32)
+        # Compute sigmoid gating (A_log and dt_bias already loaded outside loop)
         b_a = tl.load(p_a).to(tl.float32)
-        b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
 
         # Compute g = -exp(A_log) * softplus(a + dt_bias)
         x = b_a + b_dt_bias
@@ -114,7 +123,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         b_g = -tl.exp(b_A_log) * softplus_x
 
         # Compute beta = sigmoid(b)
-        b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+        b_beta = tl.sigmoid(b_b)
 
         # Apply L2 normalization if enabled
         if USE_QK_L2NORM_IN_KERNEL:
@@ -150,13 +159,12 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         p_b += HV
         p_a += HV
 
-    # Store final state back to h0_source with bounds checking
+    # Store final state back to h0_source using cached index
     if USE_INITIAL_STATE:
-        idx = tl.load(h0_indices + i_n)
-        if idx >= 0:
+        if h0_idx >= 0:
             p_h0 = (
                 h0_source
-                + idx * HV * K * V
+                + h0_idx * HV * K * V
                 + i_hv * K * V
                 + o_k[:, None] * V
                 + o_v[None, :]
@@ -190,7 +198,11 @@ def fused_sigmoid_gating_delta_rule_update(
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 8)
+    BK = triton.next_power_of_2(K)
+    # Use BV=16 to halve V-dimension program count vs BV=8, improving
+    # kernel scheduling efficiency and h0_source memory coalescing.
+    # Register pressure: b_h[BK=128, BV=16] / 32 threads = 64 regs/thread, well within limits.
+    BV = min(triton.next_power_of_2(V), 16)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3
