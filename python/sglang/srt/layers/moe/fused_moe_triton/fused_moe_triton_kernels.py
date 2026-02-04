@@ -376,6 +376,7 @@ def fused_moe_kernel(
     c_sorted: tl.constexpr,
     filter_expert: tl.constexpr,
     swap_ab: tl.constexpr,
+    SPLIT_K: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -411,6 +412,13 @@ def fused_moe_kernel(
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    # Split-K support: if SPLIT_K > 1, get the split index from axis=1
+    if SPLIT_K > 1:
+        pid_k = tl.program_id(axis=1)
+    else:
+        pid_k = 0
+
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
@@ -454,12 +462,22 @@ def fused_moe_kernel(
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    # Calculate K range for this split when SPLIT_K > 1
+    if SPLIT_K > 1:
+        k_chunk_size = tl.cdiv(K, SPLIT_K)
+        k_start = pid_k * k_chunk_size
+        k_end = tl.minimum((pid_k + 1) * k_chunk_size, K)
+    else:
+        k_start = 0
+        k_end = K
+
     if a_desc is not None:
         assert use_fp8_w8a8 and group_n > 0 and group_k > 0
         start_offs_m = pid_m * BLOCK_SIZE_M
     else:
         a_ptrs = a_ptr + (
-            offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
+            offs_token[:, None] // top_k * stride_am + (k_start + offs_k[None, :]) * stride_ak
         )
 
     if b_desc is not None:
@@ -468,7 +486,7 @@ def fused_moe_kernel(
         b_ptrs = (
             b_ptr
             + off_experts * stride_be
-            + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+            + ((k_start + offs_k[:, None]) * stride_bk + offs_bn[None, :] * stride_bn)
         )
 
     if bias_ptr is not None:
@@ -519,11 +537,11 @@ def fused_moe_kernel(
     else:
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-    for k_start in range(0, K, BLOCK_SIZE_K):
+    for k in range(k_start, k_end, BLOCK_SIZE_K):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
         if a_desc is not None:
-            a = a_desc.load([start_offs_m, k_start])
+            a = a_desc.load([start_offs_m, k])
         elif even_Ks:
             a = tl.load(
                 a_ptrs,
@@ -533,27 +551,27 @@ def fused_moe_kernel(
         else:
             a = tl.load(
                 a_ptrs,
-                mask=token_mask[:, None] & (offs_k[None, :] < K - k_start),
+                mask=token_mask[:, None] & (offs_k[None, :] < k_end - k),
                 other=0.0,
             )
 
         if b_desc is not None:
             b = (
-                b_desc.load([off_experts_i32, start_offs_n, k_start])
+                b_desc.load([off_experts_i32, start_offs_n, k])
                 .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K)
                 .T
             )
         elif even_Ks:
             b = tl.load(b_ptrs)
         else:
-            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k_start, other=0.0)
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < k_end - k, other=0.0)
 
         # We accumulate along the K dimension.
         if use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
         elif use_fp8_w8a8 or use_int8_w8a8:
             if group_k > 0 and group_n > 0:
-                offs_ks = k_start // group_k
+                offs_ks = k // group_k
                 a_scale = tl.load(
                     a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
                 )
@@ -589,12 +607,15 @@ def fused_moe_kernel(
         if group_k == 0 or group_n == 0:
             accumulator *= a_scale * b_scale
 
-    if bias_ptr is not None:
-        accumulator += bias
+    # Only apply bias and routing weights when SPLIT_K == 1
+    # For SPLIT_K > 1, these should be applied in a separate reduction step
+    if SPLIT_K == 1:
+        if bias_ptr is not None:
+            accumulator += bias
 
-    if MUL_ROUTED_WEIGHT:
-        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
-        accumulator *= moe_weight[:, None]
+        if MUL_ROUTED_WEIGHT:
+            moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
+            accumulator *= moe_weight[:, None]
 
     accumulator = accumulator.to(compute_type)
     # -----------------------------------------------------------
@@ -607,7 +628,16 @@ def fused_moe_kernel(
     else:
         c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+    # For SPLIT_K > 1, use atomic add to accumulate partial results
+    if SPLIT_K > 1:
+        # Use atomic_add for each element (slow but correct)
+        for i in range(BLOCK_SIZE_M):
+            for j in range(BLOCK_SIZE_N):
+                if c_mask[i, j]:
+                    tl.atomic_add(c_ptrs + i * stride_cm + j * stride_cn, accumulator[i, j])
+    else:
+        tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
 def invoke_fused_moe_kernel(
@@ -694,16 +724,28 @@ def invoke_fused_moe_kernel(
         assert A_scale is None
         assert B_scale is None
 
-    grid = lambda META: (
-        triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
-        * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
-    )
-
     K = B.shape[2] - padded_size
     if K % config["BLOCK_SIZE_K"] == 0:
         even_Ks = True
     else:
         even_Ks = False
+
+    # Support split-k optimization
+    split_k = config.get("SPLIT_K", 1)
+    if split_k > 1:
+        # When using split-k, add a second grid dimension
+        grid = lambda META: (
+            triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
+            * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
+            split_k,
+        )
+        # Initialize output to zero for atomic adds
+        C.zero_()
+    else:
+        grid = lambda META: (
+            triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
+            * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
+        )
 
     if (
         (use_int8_w8a16 or use_int4_w4a16)
@@ -775,6 +817,11 @@ def invoke_fused_moe_kernel(
         else:
             b_desc = None
 
+        # Ensure SPLIT_K is in config with default value of 1
+        kernel_config = dict(config)
+        if "SPLIT_K" not in kernel_config:
+            kernel_config["SPLIT_K"] = 1
+
         fused_moe_kernel[grid](
             A,
             a_desc,
@@ -819,7 +866,7 @@ def invoke_fused_moe_kernel(
             c_sorted=c_sorted,
             filter_expert=filter_expert,
             swap_ab=swap_ab,
-            **config,
+            **kernel_config,
         )
 
 
