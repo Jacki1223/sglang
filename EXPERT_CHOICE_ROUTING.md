@@ -97,9 +97,16 @@ topk = TopK(
 
 ## 📊 使用方法
 
-### 方法1：在模型配置中启用
+### ⚠️ 重要说明
 
-如果你正在定义一个新的MoE模型，可以在TopK层初始化时启用：
+Expert Choice Routing有两种使用方式：
+
+1. **在完整SGLang服务中**：通过TopK类使用（需要初始化分布式环境）
+2. **在独立测试/推理中**：直接调用`expert_choice_topk()`函数
+
+### 方法1：在SGLang服务/模型中启用（推荐）
+
+如果你正在定义一个新的MoE模型或在SGLang服务中使用，可以在TopK层初始化时启用：
 
 ```python
 from sglang.srt.layers.moe.topk import TopK
@@ -125,6 +132,8 @@ class MyMoEModel(nn.Module):
         # ... 继续MoE计算 ...
 ```
 
+**注意**：这种方法需要SGLang的完整运行环境（包括分布式初始化），适合在实际服务中使用。
+
 ### 方法2：修改现有模型
 
 对于已有的MoE模型，找到TopK层的初始化代码并添加参数：
@@ -142,13 +151,14 @@ topk = TopK(
 )
 ```
 
-### 方法3：直接调用函数
+### 方法3：直接调用函数（用于测试/独立推理）
 
-如果需要直接调用expert choice routing函数：
+如果需要在测试或独立推理场景中使用，可以直接调用expert choice routing函数：
 
 ```python
 from sglang.srt.layers.moe.topk import expert_choice_topk
 
+# 直接调用函数，不需要分布式环境
 topk_weights, topk_ids = expert_choice_topk(
     hidden_states=hidden_states,      # (num_tokens, hidden_dim)
     gating_output=router_logits,      # (num_tokens, num_experts)
@@ -158,6 +168,8 @@ topk_weights, topk_ids = expert_choice_topk(
     scoring_func="softmax"
 )
 ```
+
+**优势**：这种方法不需要初始化SGLang的分布式环境，适合快速测试和验证。
 
 ## 🧪 测试和验证
 

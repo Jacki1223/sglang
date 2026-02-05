@@ -7,7 +7,7 @@ for better load balancing in MoE models.
 """
 
 import torch
-from sglang.srt.layers.moe.topk import TopK, expert_choice_topk
+from sglang.srt.layers.moe.topk import expert_choice_topk, fused_topk
 
 
 def test_expert_choice_vs_standard():
@@ -34,20 +34,14 @@ def test_expert_choice_vs_standard():
     # Test 1: Standard routing (token chooses expert)
     print("1. Standard Routing (Token-Choose-Expert):")
     print("-" * 80)
-    topk_standard = TopK(
-        top_k=top_k,
-        use_expert_choice=False,
+
+    topk_weights_std, topk_ids_std = fused_topk(
+        hidden_states=hidden_states,
+        gating_output=router_logits,
+        topk=top_k,
         renormalize=True,
         scoring_func="softmax"
     )
-
-    output_standard = topk_standard.forward_cuda(
-        hidden_states=hidden_states,
-        router_logits=router_logits
-    )
-
-    topk_weights_std = output_standard.topk_weights
-    topk_ids_std = output_standard.topk_ids
 
     # Calculate expert load distribution
     expert_loads_std = torch.zeros(num_experts, dtype=torch.int32, device='cuda')
@@ -64,21 +58,15 @@ def test_expert_choice_vs_standard():
     # Test 2: Expert choice routing (expert chooses token)
     print("2. Expert Choice Routing (Expert-Choose-Token):")
     print("-" * 80)
-    topk_expert_choice = TopK(
-        top_k=top_k,
-        use_expert_choice=True,
-        expert_capacity_factor=1.25,
+
+    topk_weights_ec, topk_ids_ec = expert_choice_topk(
+        hidden_states=hidden_states,
+        gating_output=router_logits,
+        topk=top_k,
         renormalize=True,
+        expert_capacity_factor=1.25,
         scoring_func="softmax"
     )
-
-    output_expert_choice = topk_expert_choice.forward_cuda(
-        hidden_states=hidden_states,
-        router_logits=router_logits
-    )
-
-    topk_weights_ec = output_expert_choice.topk_weights
-    topk_ids_ec = output_expert_choice.topk_ids
 
     # Calculate expert load distribution
     expert_loads_ec = torch.zeros(num_experts, dtype=torch.int32, device='cuda')
