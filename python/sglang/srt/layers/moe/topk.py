@@ -556,8 +556,9 @@ def expert_choice_topk(
 
     # Build a dense assignment matrix using scatter
     # assignment_matrix[token_id, expert_id] = score if expert selected token, else 0
+    # Use the same dtype as router_scores to avoid type mismatch
     assignment_matrix = torch.zeros(
-        num_tokens, num_experts, dtype=torch.float32, device=device
+        num_tokens, num_experts, dtype=router_scores.dtype, device=device
     )
 
     # Use advanced indexing to fill assignment matrix
@@ -629,6 +630,9 @@ def expert_choice_topk(
         weight_sum = topk_weights.sum(dim=-1, keepdim=True)
         weight_sum = torch.where(weight_sum > 0, weight_sum, torch.ones_like(weight_sum))
         topk_weights = topk_weights / weight_sum
+
+    # Convert to float32 for output (consistent with fused_topk)
+    topk_weights = topk_weights.to(torch.float32)
 
     # Apply expert location mapping
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
