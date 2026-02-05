@@ -553,10 +553,21 @@ def expert_choice_topk(
         sorted=True
     )
 
-    # Now we need to convert from expert-centric view to token-centric view
-    # Build a sparse assignment: which experts are assigned to each token
+    # Convert from expert-centric view to token-centric view
+    # Build a comprehensive expert-token assignment matrix with scores
 
-    # Initialize output tensors
+    # Create a sparse representation of (token_id, expert_id, score) tuples
+    # for all expert-token pairs where the expert selected the token
+    actual_capacity = min(expert_capacity, num_tokens)
+
+    # Flatten the expert selections into (expert_id, token_id, score) format
+    # Shape: (num_experts * actual_capacity, 3) where columns are [expert_id, token_id, score]
+    expert_ids_flat = torch.arange(num_experts, device=hidden_states.device).unsqueeze(1).expand(-1, actual_capacity).flatten()
+    token_ids_flat = expert_topk_token_ids.flatten()
+    scores_flat = expert_topk_scores.flatten()
+
+    # For each token, collect all experts that selected it and their scores
+    # Then choose the top-k experts with highest scores for each token
     topk_weights = torch.zeros(
         num_tokens, topk, dtype=torch.float32, device=hidden_states.device
     )
@@ -564,44 +575,43 @@ def expert_choice_topk(
         (num_tokens, topk), -1, dtype=torch.int32, device=hidden_states.device
     )
 
-    # Track how many experts each token has been assigned to
-    token_expert_counts = torch.zeros(num_tokens, dtype=torch.int32, device=hidden_states.device)
-
-    # For each expert, assign its selected tokens
-    for expert_id in range(num_experts):
-        selected_tokens = expert_topk_token_ids[expert_id]  # (expert_capacity,)
-        selected_scores = expert_topk_scores[expert_id]  # (expert_capacity,)
-
-        for i in range(len(selected_tokens)):
-            token_id = selected_tokens[i].item()
-            score = selected_scores[i].item()
-
-            # Check if this token still has capacity for more experts
-            current_count = token_expert_counts[token_id].item()
-            if current_count < topk:
-                topk_ids[token_id, current_count] = expert_id
-                topk_weights[token_id, current_count] = score
-                token_expert_counts[token_id] += 1
-
-    # Handle tokens that didn't get assigned enough experts
-    # Assign them to experts with lowest load
+    # Group by token and select top-k experts per token
     for token_id in range(num_tokens):
-        assigned_count = token_expert_counts[token_id].item()
-        if assigned_count < topk:
-            # Get this token's top experts from the original scores
-            token_scores = router_scores[token_id]  # (num_experts,)
-            _, top_experts = torch.topk(token_scores, k=topk, largest=True)
+        # Find all experts that selected this token
+        mask = token_ids_flat == token_id
+        if mask.any():
+            candidate_experts = expert_ids_flat[mask]
+            candidate_scores = scores_flat[mask]
 
-            # Fill in missing expert assignments
-            for expert_id in top_experts:
-                if assigned_count >= topk:
-                    break
-                expert_id = expert_id.item()
-                # Check if this expert is not already assigned
-                if expert_id not in topk_ids[token_id, :assigned_count]:
-                    topk_ids[token_id, assigned_count] = expert_id
-                    topk_weights[token_id, assigned_count] = token_scores[expert_id].item()
-                    assigned_count += 1
+            # Select top-k experts with highest scores for this token
+            num_candidates = len(candidate_scores)
+            k = min(topk, num_candidates)
+
+            if k > 0:
+                top_scores, top_indices = torch.topk(candidate_scores, k=k, largest=True)
+                topk_weights[token_id, :k] = top_scores
+                topk_ids[token_id, :k] = candidate_experts[top_indices]
+
+        # If this token wasn't selected by enough experts, fill with its top choices
+        if topk_ids[token_id, topk-1] == -1:
+            # Count how many valid assignments we have
+            num_assigned = (topk_ids[token_id] != -1).sum().item()
+            if num_assigned < topk:
+                # Get top experts from original router scores
+                token_scores = router_scores[token_id]
+                _, top_expert_ids = torch.topk(token_scores, k=topk, largest=True)
+
+                # Fill in missing slots with experts not already assigned
+                assigned_experts = set(topk_ids[token_id, :num_assigned].cpu().tolist())
+                fill_idx = num_assigned
+                for expert_id in top_expert_ids:
+                    expert_id_val = expert_id.item()
+                    if expert_id_val not in assigned_experts and fill_idx < topk:
+                        topk_ids[token_id, fill_idx] = expert_id_val
+                        topk_weights[token_id, fill_idx] = token_scores[expert_id_val].item()
+                        fill_idx += 1
+                        if fill_idx >= topk:
+                            break
 
     # Renormalize weights if requested
     if renormalize:
