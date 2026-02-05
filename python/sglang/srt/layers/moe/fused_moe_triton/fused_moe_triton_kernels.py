@@ -880,7 +880,7 @@ def act_and_mul_kernel(
     gate_output_ptr = gateup_output_ptr
     up_output_ptr = gateup_output_ptr + half_hidden_size
 
-    for start_offset in tl.range(0, half_hidden_size, BLOCK_SIZE):
+    for start_offset in range(0, half_hidden_size, BLOCK_SIZE):
         offset = start_offset + tl.arange(0, BLOCK_SIZE)
         mask = offset < half_hidden_size
 
@@ -964,7 +964,7 @@ def _moe_sum_reduce_kernel(
 
     accumulator = tl.zeros((BLOCK_M, BLOCK_DIM), dtype=tl.float32)
 
-    for i in tl.range(0, topk_num, num_stages=NUM_STAGE):
+    for i in range(0, topk_num):
         tile = tl.load(
             base_ptrs + i * input_stride_1,
             mask=mask_token[:, None] & mask_dim[None, :],
