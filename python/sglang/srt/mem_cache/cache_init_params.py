@@ -24,6 +24,7 @@ class CacheInitParams:
 
     enable_metrics: bool = False
     enable_kv_cache_events: bool = False
+    enable_triton_kernels: bool = True  # Enable optimized Triton kernels for RadixCache
 
     enable_mamba_extra_buffer: bool = False
 

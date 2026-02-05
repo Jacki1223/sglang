@@ -34,6 +34,21 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Import optimized Triton kernels
+try:
+    from sglang.srt.mem_cache.radix_cache_kernels import (
+        OptimizedRadixCacheOps,
+        token_match_fast,
+    )
+
+    TRITON_AVAILABLE = True
+except ImportError:
+    logger.warning(
+        "Triton kernels not available for RadixCache optimization. "
+        "Falling back to Python implementation."
+    )
+    TRITON_AVAILABLE = False
+
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
@@ -165,6 +180,19 @@ def _check_extra_key(key0: RadixKey, key1: RadixKey):
 
 def _key_match_page_size1(key0: RadixKey, key1: RadixKey):
     _check_extra_key(key0, key1)
+
+    # Use optimized Triton kernel for long sequences when available
+    if TRITON_AVAILABLE and len(key0.token_ids) >= 32:
+        try:
+            # Convert to tensors for GPU processing
+            key0_tensor = torch.tensor(key0.token_ids, dtype=torch.int64)
+            key1_tensor = torch.tensor(key1.token_ids, dtype=torch.int64)
+            return token_match_fast(key0_tensor, key1_tensor)
+        except Exception as e:
+            logger.debug(f"Triton kernel failed, falling back to Python: {e}")
+            # Fallback to Python implementation
+
+    # Original Python implementation (fallback or for short sequences)
     i = 0
     for k0, k1 in zip(key0.token_ids, key1.token_ids):
         if k0 != k1:
@@ -267,6 +295,7 @@ class RadixCache(BasePrefixCache):
         self.is_eagle = params.is_eagle
         self.disable_finished_insert = params.disable_finished_insert
         self.eviction_policy = params.eviction_policy.lower()
+        self.enable_triton_kernels = params.enable_triton_kernels and TRITON_AVAILABLE
 
         self.kv_event_queue = []
 
@@ -279,7 +308,11 @@ class RadixCache(BasePrefixCache):
             self.device = torch.device("cpu")
 
         if self.page_size == 1:
-            self.key_match_fn = _key_match_page_size1
+            # Use optimized kernel when enabled
+            if self.enable_triton_kernels:
+                self.key_match_fn = self._key_match_optimized
+            else:
+                self.key_match_fn = _key_match_page_size1
             self.get_child_key_fn = get_child_key
         else:
             self.key_match_fn = partial(_key_match_paged, page_size=self.page_size)
@@ -324,6 +357,33 @@ class RadixCache(BasePrefixCache):
         return RadixCache(params)
 
     ##### Public API #####
+
+    def _key_match_optimized(self, key0: RadixKey, key1: RadixKey):
+        """
+        Optimized key matching using Triton kernels for long sequences.
+
+        This method provides a drop-in replacement for _key_match_page_size1
+        that uses GPU acceleration for better performance on long sequences.
+        """
+        _check_extra_key(key0, key1)
+
+        # Use Triton kernel for sequences >= 32 tokens
+        if len(key0.token_ids) >= 32 and len(key1.token_ids) >= 32:
+            try:
+                # Avoid repeated tensor creation by caching if possible
+                key0_tensor = torch.tensor(key0.token_ids, dtype=torch.int64)
+                key1_tensor = torch.tensor(key1.token_ids, dtype=torch.int64)
+                return token_match_fast(key0_tensor, key1_tensor)
+            except Exception as e:
+                logger.debug(f"Triton kernel failed, falling back to Python: {e}")
+
+        # Fallback to Python for short sequences or on error
+        i = 0
+        for k0, k1 in zip(key0.token_ids, key1.token_ids):
+            if k0 != k1:
+                break
+            i += 1
+        return i
 
     def reset(self):
         # Initialize root with minimum priority so any real priority overrides it
