@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, List
 
 import torch.cuda
 
+from sglang.srt.eplb.expert_compute_profiler import get_global_expert_compute_profiler
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 
@@ -70,8 +71,22 @@ class EPLBManager:
         if not self._check_rebalance_needed(average_utilization_rate_over_window):
             return
 
+        # Get compute cost from profiler if available
+        compute_cost_per_expert = None
+        profiler = get_global_expert_compute_profiler()
+        if profiler is not None and profiler.profiling_enabled:
+            compute_cost_weight, _ = profiler.get_adjusted_expert_load(logical_count)
+            # Convert to physical expert level for rebalancing
+            compute_cost_per_expert = compute_cost_weight
+            logger.info(
+                "[EPLBManager] Using compute-cost-aware rebalancing with profiled data"
+            )
+
         expert_location_metadata = ExpertLocationMetadata.init_by_eplb(
-            self._server_args, self._model_runner.model_config, logical_count
+            self._server_args,
+            self._model_runner.model_config,
+            logical_count,
+            compute_cost_per_expert=compute_cost_per_expert,
         )
 
         update_layer_ids_chunks = self._compute_update_layer_ids_chunks()

@@ -506,6 +506,11 @@ class ServerArgs:
     ] = None
     expert_distribution_recorder_buffer_size: Optional[int] = None
     enable_expert_distribution_metrics: bool = False
+    # Expert compute cost profiling for compute-aware load balancing
+    enable_expert_compute_profiling: bool = False
+    expert_compute_profiling_warmup_steps: int = 10
+    expert_compute_profiling_interval: int = 1
+    eplb_compute_cost_alpha: float = 0.5  # 0.0=token-only, 1.0=compute-cost-only
     deepep_config: Optional[str] = None
     moe_dense_tp_size: Optional[int] = None
     elastic_ep_backend: Literal[None, "mooncake"] = None
@@ -4061,6 +4066,29 @@ class ServerArgs:
             "--enable-expert-distribution-metrics",
             action="store_true",
             help="Enable logging metrics for expert balancedness",
+        )
+        parser.add_argument(
+            "--enable-expert-compute-profiling",
+            action="store_true",
+            help="Enable expert compute cost profiling for compute-aware load balancing",
+        )
+        parser.add_argument(
+            "--expert-compute-profiling-warmup-steps",
+            type=int,
+            default=ServerArgs.expert_compute_profiling_warmup_steps,
+            help="Number of warmup steps before starting expert compute profiling",
+        )
+        parser.add_argument(
+            "--expert-compute-profiling-interval",
+            type=int,
+            default=ServerArgs.expert_compute_profiling_interval,
+            help="Profile expert compute cost every N forward passes (1 = every pass)",
+        )
+        parser.add_argument(
+            "--eplb-compute-cost-alpha",
+            type=float,
+            default=ServerArgs.eplb_compute_cost_alpha,
+            help="Blending factor for compute-cost-aware load balancing (0.0 = token-only, 1.0 = compute-cost-only)",
         )
         parser.add_argument(
             "--deepep-config",

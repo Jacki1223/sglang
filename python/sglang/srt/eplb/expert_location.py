@@ -145,7 +145,10 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def init_by_eplb(
-        server_args: ServerArgs, model_config: ModelConfig, logical_count: torch.Tensor
+        server_args: ServerArgs,
+        model_config: ModelConfig,
+        logical_count: torch.Tensor,
+        compute_cost_per_expert: Optional[torch.Tensor] = None,
     ):
         if not isinstance(logical_count, torch.Tensor):
             logical_count = torch.tensor(logical_count)
@@ -163,6 +166,14 @@ class ExpertLocationMetadata:
         num_groups = model_config_for_expert_location.num_groups
         num_nodes = server_args.nnodes
 
+        # Prepare compute cost if available
+        if compute_cost_per_expert is not None:
+            if not isinstance(compute_cost_per_expert, torch.Tensor):
+                compute_cost_per_expert = torch.tensor(compute_cost_per_expert)
+            if len(compute_cost_per_expert.shape) == 2:
+                compute_cost_per_expert = compute_cost_per_expert.unsqueeze(0)
+            compute_cost_per_expert = compute_cost_per_expert.to(server_args.device)
+
         physical_to_logical_map, logical_to_all_physical_map, expert_count = (
             eplb_algorithms.rebalance_experts(
                 tokens_per_expert=logical_count,
@@ -175,6 +186,8 @@ class ExpertLocationMetadata:
                     num_groups=num_groups,
                     num_nodes=num_nodes,
                 ),
+                compute_cost_per_expert=compute_cost_per_expert,
+                compute_cost_alpha=server_args.eplb_compute_cost_alpha,
             )
         )
 
