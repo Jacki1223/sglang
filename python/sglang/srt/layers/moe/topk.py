@@ -117,6 +117,8 @@ class TopKConfig:
     fused_shared_experts_scaling_factor: Optional[float] = None
     output_format: Optional[TopKOutputFormat] = None
     scoring_func: str = "softmax"
+    use_expert_choice: bool = False  # Enable expert-choice routing for better load balancing
+    expert_capacity_factor: float = 1.25  # Capacity factor for expert choice routing
 
 
 # -------------------------------- TopKOutput ---------------------------------------
@@ -223,6 +225,8 @@ class TopK(MultiPlatformOp):
         apply_routed_scaling_factor_on_output: Optional[bool] = False,
         output_format: Optional[TopKOutputFormat] = None,
         fused_shared_experts_scaling_factor: Optional[float] = None,
+        use_expert_choice: bool = False,
+        expert_capacity_factor: float = 1.25,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -246,6 +250,8 @@ class TopK(MultiPlatformOp):
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
             output_format=output_format,
             scoring_func=scoring_func,
+            use_expert_choice=use_expert_choice,
+            expert_capacity_factor=expert_capacity_factor,
         )
 
     def forward_native(
@@ -483,6 +489,135 @@ def fused_topk(
 
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    return topk_weights, topk_ids
+
+
+def expert_choice_topk(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    expert_capacity_factor: float = 1.25,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    scoring_func: str = "softmax",
+):
+    """
+    Expert Choice Routing: Instead of each token choosing top-k experts,
+    each expert chooses top-k tokens to process.
+
+    This approach provides better load balancing by ensuring each expert
+    processes approximately the same number of tokens.
+
+    Args:
+        hidden_states: (num_tokens, hidden_dim)
+        gating_output: (num_tokens, num_experts) - router logits
+        topk: number of experts per token (used to compute capacity)
+        renormalize: whether to renormalize weights
+        expert_capacity_factor: multiplier for expert capacity
+        num_token_non_padded: mask for padded tokens
+        expert_location_dispatch_info: expert mapping info
+        scoring_func: "softmax" or "sigmoid"
+
+    Returns:
+        topk_weights: (num_tokens, topk) - routing weights
+        topk_ids: (num_tokens, topk) - expert assignments
+    """
+    num_tokens, num_experts = gating_output.shape
+
+    # Calculate expert capacity: how many tokens each expert can process
+    # capacity = (num_tokens * topk / num_experts) * capacity_factor
+    expert_capacity = int((num_tokens * topk / num_experts) * expert_capacity_factor)
+    expert_capacity = max(expert_capacity, topk)  # At least topk tokens per expert
+
+    # Compute routing scores
+    if scoring_func == "softmax":
+        # Softmax over experts for each token
+        router_scores = torch.softmax(gating_output, dim=-1)  # (num_tokens, num_experts)
+    elif scoring_func == "sigmoid":
+        router_scores = torch.sigmoid(gating_output)
+    else:
+        raise ValueError(f"Invalid scoring function: {scoring_func}")
+
+    # Transpose: now we have (num_experts, num_tokens) - each expert's view of all tokens
+    expert_token_scores = router_scores.transpose(0, 1)  # (num_experts, num_tokens)
+
+    # Each expert selects top-capacity tokens
+    # expert_topk_scores: (num_experts, expert_capacity)
+    # expert_topk_token_ids: (num_experts, expert_capacity) - which tokens each expert selects
+    expert_topk_scores, expert_topk_token_ids = torch.topk(
+        expert_token_scores,
+        k=min(expert_capacity, num_tokens),
+        dim=1,
+        largest=True,
+        sorted=True
+    )
+
+    # Now we need to convert from expert-centric view to token-centric view
+    # Build a sparse assignment: which experts are assigned to each token
+
+    # Initialize output tensors
+    topk_weights = torch.zeros(
+        num_tokens, topk, dtype=torch.float32, device=hidden_states.device
+    )
+    topk_ids = torch.full(
+        (num_tokens, topk), -1, dtype=torch.int32, device=hidden_states.device
+    )
+
+    # Track how many experts each token has been assigned to
+    token_expert_counts = torch.zeros(num_tokens, dtype=torch.int32, device=hidden_states.device)
+
+    # For each expert, assign its selected tokens
+    for expert_id in range(num_experts):
+        selected_tokens = expert_topk_token_ids[expert_id]  # (expert_capacity,)
+        selected_scores = expert_topk_scores[expert_id]  # (expert_capacity,)
+
+        for i in range(len(selected_tokens)):
+            token_id = selected_tokens[i].item()
+            score = selected_scores[i].item()
+
+            # Check if this token still has capacity for more experts
+            current_count = token_expert_counts[token_id].item()
+            if current_count < topk:
+                topk_ids[token_id, current_count] = expert_id
+                topk_weights[token_id, current_count] = score
+                token_expert_counts[token_id] += 1
+
+    # Handle tokens that didn't get assigned enough experts
+    # Assign them to experts with lowest load
+    for token_id in range(num_tokens):
+        assigned_count = token_expert_counts[token_id].item()
+        if assigned_count < topk:
+            # Get this token's top experts from the original scores
+            token_scores = router_scores[token_id]  # (num_experts,)
+            _, top_experts = torch.topk(token_scores, k=topk, largest=True)
+
+            # Fill in missing expert assignments
+            for expert_id in top_experts:
+                if assigned_count >= topk:
+                    break
+                expert_id = expert_id.item()
+                # Check if this expert is not already assigned
+                if expert_id not in topk_ids[token_id, :assigned_count]:
+                    topk_ids[token_id, assigned_count] = expert_id
+                    topk_weights[token_id, assigned_count] = token_scores[expert_id].item()
+                    assigned_count += 1
+
+    # Renormalize weights if requested
+    if renormalize:
+        # Create a mask for valid experts (not -1)
+        valid_mask = topk_ids >= 0
+        topk_weights = topk_weights * valid_mask.float()
+
+        # Normalize per token
+        weight_sum = topk_weights.sum(dim=-1, keepdim=True)
+        weight_sum = torch.where(weight_sum > 0, weight_sum, torch.ones_like(weight_sum))
+        topk_weights = topk_weights / weight_sum
+
+    # Apply expert location mapping
+    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+
     return topk_weights, topk_ids
 
 
@@ -997,17 +1132,31 @@ def select_experts(
         )
     elif custom_routing_function is None:
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
-        # Qwen3MOE uses fused_topk
-        topk_weights, topk_ids = fused_topk(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            topk=num_routed_topk if _use_aiter else top_k,
-            renormalize=renormalize,
-            correction_bias=correction_bias,
-            num_token_non_padded=num_token_non_padded,
-            expert_location_dispatch_info=expert_location_dispatch_info,
-            scoring_func=scoring_func,
-        )
+        # Check if expert choice routing is enabled
+        if topk_config.use_expert_choice:
+            # Expert Choice Routing: experts select tokens
+            topk_weights, topk_ids = expert_choice_topk(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=num_routed_topk if _use_aiter else top_k,
+                renormalize=renormalize,
+                expert_capacity_factor=topk_config.expert_capacity_factor,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+                scoring_func=scoring_func,
+            )
+        else:
+            # Standard Routing: tokens select experts (Qwen3MOE uses fused_topk)
+            topk_weights, topk_ids = fused_topk(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=num_routed_topk if _use_aiter else top_k,
+                renormalize=renormalize,
+                correction_bias=correction_bias,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+                scoring_func=scoring_func,
+            )
     else:
         assert (
             num_token_non_padded is None
