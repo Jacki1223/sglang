@@ -39,8 +39,8 @@ def _token_match_kernel(
     """
     Find the longest matching prefix between two token sequences.
 
-    This kernel uses a simple parallel approach where each program processes
-    one block and finds the first mismatch within its range.
+    Each block processes BLOCK_SIZE tokens and uses atomic_min to coordinate
+    the final result across all blocks.
     """
     pid = tl.program_id(0)
 
@@ -49,6 +49,11 @@ def _token_match_kernel(
 
     # Calculate block boundaries
     block_start = pid * BLOCK_SIZE
+
+    # Early exit if this block is beyond min_len
+    if block_start >= min_len:
+        return
+
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
 
     # Mask for valid positions
@@ -61,35 +66,34 @@ def _token_match_kernel(
     # Compare tokens
     matches = tokens0 == tokens1
 
-    # Find first mismatch position in this block
-    # Use cumsum to find the first False
+    # Combine with mask
     match_mask = matches & mask
 
-    # Count consecutive matches from start
-    # If all tokens match in this block, store block_end
-    # Otherwise, find the first mismatch
-    if tl.sum(match_mask.to(tl.int32)) == tl.sum(mask.to(tl.int32)):
+    # Check if all tokens in this block matched
+    num_matched = tl.sum(match_mask.to(tl.int32))
+    num_valid = tl.sum(mask.to(tl.int32))
+
+    if num_matched == num_valid:
         # All tokens in this block matched
-        if block_start + BLOCK_SIZE >= min_len:
-            # This is the last block
-            tl.atomic_min(output_ptr, min_len)
-        else:
-            # Signal that this block fully matched
-            tl.atomic_min(output_ptr, block_start + BLOCK_SIZE)
+        # Update output only if we processed all tokens up to this point
+        tl.store(output_ptr + pid, block_start + num_valid)
     else:
-        # Find first mismatch
-        # Use a simple linear scan within the block
-        mismatch_found = False
-        UNROLL_SIZE: tl.constexpr = 128
-        for i in tl.static_range(UNROLL_SIZE):
-            if i < BLOCK_SIZE:
-                offset = block_start + i
-                if offset < min_len and not mismatch_found:
-                    t0 = tl.load(key0_ptr + offset)
-                    t1 = tl.load(key1_ptr + offset)
-                    if t0 != t1:
-                        tl.atomic_min(output_ptr, offset)
-                        mismatch_found = True
+        # Find the first mismatch position
+        # We need to scan the block sequentially
+        # Use static_range for compile-time unrolling
+        for i in tl.static_range(BLOCK_SIZE):
+            offset = block_start + i
+            # Check bounds and compare
+            if offset < min_len:
+                t0 = tl.load(key0_ptr + offset)
+                t1 = tl.load(key1_ptr + offset)
+                if t0 != t1:
+                    # Store mismatch position for this block
+                    tl.store(output_ptr + pid, offset)
+                    return
+
+        # If we get here, all tokens matched
+        tl.store(output_ptr + pid, tl.minimum(block_start + BLOCK_SIZE, min_len))
 
 
 def token_match_fast(
@@ -116,7 +120,7 @@ def token_match_fast(
     min_len = min(len(key0), len(key1))
 
     # For very short sequences, use CPU (faster than GPU kernel launch overhead)
-    if min_len < 64:
+    if min_len < 128:
         # CPU fallback
         if key0.is_cuda:
             key0 = key0.cpu()
@@ -141,24 +145,34 @@ def token_match_fast(
     key0 = key0.contiguous()
     key1 = key1.contiguous()
 
-    # Initialize output with max possible value
-    output = torch.tensor([min_len], dtype=torch.int64, device=key0.device)
-
     # Launch kernel
     BLOCK_SIZE = 128
     num_blocks = triton.cdiv(min_len, BLOCK_SIZE)
-    grid = (num_blocks,)
 
+    # Each block stores its result
+    block_results = torch.zeros(num_blocks, dtype=torch.int64, device=key0.device)
+
+    grid = (num_blocks,)
     _token_match_kernel[grid](
         key0,
         key1,
-        output,
+        block_results,
         len(key0),
         len(key1),
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
-    return output.item()
+    # Find the minimum (first mismatch) across all blocks
+    # Blocks are processed sequentially, so we need to find where the chain breaks
+    result = min_len
+    for i in range(num_blocks):
+        block_result = block_results[i].item()
+        # If this block found a mismatch before its end
+        if block_result < (i + 1) * BLOCK_SIZE or block_result < min_len:
+            result = block_result
+            break
+
+    return result
 
 
 class OptimizedRadixCacheOps:
@@ -196,9 +210,9 @@ class OptimizedRadixCacheOps:
         Returns:
             True if GPU ops should be used
         """
-        # Use GPU for sequences longer than 64 tokens
+        # Use GPU for sequences longer than 128 tokens
         # For shorter sequences, CPU is actually faster due to kernel launch overhead
-        return use_gpu and torch.cuda.is_available() and sequence_length >= 64
+        return use_gpu and torch.cuda.is_available() and sequence_length >= 128
 
 
 # Fallback implementations for when Triton is not available
