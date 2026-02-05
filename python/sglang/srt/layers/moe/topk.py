@@ -509,6 +509,9 @@ def expert_choice_topk(
     This approach provides better load balancing by ensuring each expert
     processes approximately the same number of tokens.
 
+    CUDA Graph compatible version - uses pure tensor operations without
+    CPU synchronization.
+
     Args:
         hidden_states: (num_tokens, hidden_dim)
         gating_output: (num_tokens, num_experts) - router logits
@@ -524,100 +527,103 @@ def expert_choice_topk(
         topk_ids: (num_tokens, topk) - expert assignments
     """
     num_tokens, num_experts = gating_output.shape
+    device = hidden_states.device
 
     # Calculate expert capacity: how many tokens each expert can process
-    # capacity = (num_tokens * topk / num_experts) * capacity_factor
     expert_capacity = int((num_tokens * topk / num_experts) * expert_capacity_factor)
-    expert_capacity = max(expert_capacity, topk)  # At least topk tokens per expert
+    expert_capacity = max(expert_capacity, topk)
 
     # Compute routing scores
     if scoring_func == "softmax":
-        # Softmax over experts for each token
-        router_scores = torch.softmax(gating_output, dim=-1)  # (num_tokens, num_experts)
+        router_scores = torch.softmax(gating_output, dim=-1)
     elif scoring_func == "sigmoid":
         router_scores = torch.sigmoid(gating_output)
     else:
         raise ValueError(f"Invalid scoring function: {scoring_func}")
 
-    # Transpose: now we have (num_experts, num_tokens) - each expert's view of all tokens
-    expert_token_scores = router_scores.transpose(0, 1)  # (num_experts, num_tokens)
+    # Transpose: (num_experts, num_tokens)
+    expert_token_scores = router_scores.transpose(0, 1)
 
     # Each expert selects top-capacity tokens
-    # expert_topk_scores: (num_experts, expert_capacity)
-    # expert_topk_token_ids: (num_experts, expert_capacity) - which tokens each expert selects
+    actual_capacity = min(expert_capacity, num_tokens)
     expert_topk_scores, expert_topk_token_ids = torch.topk(
         expert_token_scores,
-        k=min(expert_capacity, num_tokens),
+        k=actual_capacity,
         dim=1,
         largest=True,
         sorted=True
     )
 
-    # Convert from expert-centric view to token-centric view
-    # Build a comprehensive expert-token assignment matrix with scores
-
-    # Create a sparse representation of (token_id, expert_id, score) tuples
-    # for all expert-token pairs where the expert selected the token
-    actual_capacity = min(expert_capacity, num_tokens)
-
-    # Flatten the expert selections into (expert_id, token_id, score) format
-    # Shape: (num_experts * actual_capacity, 3) where columns are [expert_id, token_id, score]
-    expert_ids_flat = torch.arange(num_experts, device=hidden_states.device).unsqueeze(1).expand(-1, actual_capacity).flatten()
-    token_ids_flat = expert_topk_token_ids.flatten()
-    scores_flat = expert_topk_scores.flatten()
-
-    # For each token, collect all experts that selected it and their scores
-    # Then choose the top-k experts with highest scores for each token
-    topk_weights = torch.zeros(
-        num_tokens, topk, dtype=torch.float32, device=hidden_states.device
-    )
-    topk_ids = torch.full(
-        (num_tokens, topk), -1, dtype=torch.int32, device=hidden_states.device
+    # Build a dense assignment matrix using scatter
+    # assignment_matrix[token_id, expert_id] = score if expert selected token, else 0
+    assignment_matrix = torch.zeros(
+        num_tokens, num_experts, dtype=torch.float32, device=device
     )
 
-    # Group by token and select top-k experts per token
-    for token_id in range(num_tokens):
-        # Find all experts that selected this token
-        mask = token_ids_flat == token_id
-        if mask.any():
-            candidate_experts = expert_ids_flat[mask]
-            candidate_scores = scores_flat[mask]
+    # Use advanced indexing to fill assignment matrix
+    # expert_topk_token_ids: (num_experts, actual_capacity)
+    # expert_topk_scores: (num_experts, actual_capacity)
+    expert_ids_expanded = torch.arange(num_experts, device=device).unsqueeze(1).expand(-1, actual_capacity)
 
-            # Select top-k experts with highest scores for this token
-            num_candidates = len(candidate_scores)
-            k = min(topk, num_candidates)
+    # Flatten for scatter
+    token_indices = expert_topk_token_ids.flatten()  # (num_experts * actual_capacity,)
+    expert_indices = expert_ids_expanded.flatten()   # (num_experts * actual_capacity,)
+    scores_to_scatter = expert_topk_scores.flatten() # (num_experts * actual_capacity,)
 
-            if k > 0:
-                top_scores, top_indices = torch.topk(candidate_scores, k=k, largest=True)
-                topk_weights[token_id, :k] = top_scores
-                topk_ids[token_id, :k] = candidate_experts[top_indices]
+    # scatter_add to handle multiple experts selecting same token
+    assignment_matrix.index_put_(
+        (token_indices, expert_indices),
+        scores_to_scatter,
+        accumulate=False  # Use max value if multiple assignments
+    )
 
-        # If this token wasn't selected by enough experts, fill with its top choices
-        if topk_ids[token_id, topk-1] == -1:
-            # Count how many valid assignments we have
-            num_assigned = (topk_ids[token_id] != -1).sum().item()
-            if num_assigned < topk:
-                # Get top experts from original router scores
-                token_scores = router_scores[token_id]
-                _, top_expert_ids = torch.topk(token_scores, k=topk, largest=True)
+    # For each token, select top-k experts based on assignment_matrix
+    # This is CUDA Graph compatible
+    topk_weights, topk_ids = torch.topk(
+        assignment_matrix,
+        k=topk,
+        dim=1,
+        largest=True,
+        sorted=True
+    )
 
-                # Fill in missing slots with experts not already assigned
-                assigned_experts = set(topk_ids[token_id, :num_assigned].cpu().tolist())
-                fill_idx = num_assigned
-                for expert_id in top_expert_ids:
-                    expert_id_val = expert_id.item()
-                    if expert_id_val not in assigned_experts and fill_idx < topk:
-                        topk_ids[token_id, fill_idx] = expert_id_val
-                        topk_weights[token_id, fill_idx] = token_scores[expert_id_val].item()
-                        fill_idx += 1
-                        if fill_idx >= topk:
-                            break
+    # Handle tokens that weren't selected by enough experts
+    # Use original router_scores as fallback
+    # Create a mask where assignment_matrix is 0 (expert didn't select token)
+    not_selected_mask = (assignment_matrix == 0)
+
+    # For tokens not selected enough, use original router scores
+    # But zero out the scores for experts that already selected them
+    fallback_scores = torch.where(
+        not_selected_mask,
+        router_scores,
+        torch.zeros_like(router_scores)
+    )
+
+    # Check which tokens need fallback (where topk_weights has zeros)
+    needs_fallback = (topk_weights == 0)
+
+    # Always compute fallback (CUDA Graph compatible - no branching on GPU values)
+    fallback_topk_weights, fallback_topk_ids = torch.topk(
+        fallback_scores,
+        k=topk,
+        dim=1,
+        largest=True,
+        sorted=True
+    )
+
+    # Blend: use assignment_matrix scores where available, fallback otherwise
+    topk_weights = torch.where(needs_fallback, fallback_topk_weights, topk_weights)
+    topk_ids = torch.where(needs_fallback, fallback_topk_ids, topk_ids)
+
+    # Convert to int32 for topk_ids
+    topk_ids = topk_ids.to(torch.int32)
 
     # Renormalize weights if requested
     if renormalize:
-        # Create a mask for valid experts (not -1)
-        valid_mask = topk_ids >= 0
-        topk_weights = topk_weights * valid_mask.float()
+        # Mask valid weights (non-zero)
+        valid_mask = (topk_weights > 0).float()
+        topk_weights = topk_weights * valid_mask
 
         # Normalize per token
         weight_sum = topk_weights.sum(dim=-1, keepdim=True)
