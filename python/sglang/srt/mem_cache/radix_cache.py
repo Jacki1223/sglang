@@ -182,7 +182,7 @@ def _key_match_page_size1(key0: RadixKey, key1: RadixKey):
     _check_extra_key(key0, key1)
 
     # Use optimized Triton kernel for long sequences when available
-    if TRITON_AVAILABLE and len(key0.token_ids) >= 128:
+    if TRITON_AVAILABLE and len(key0.token_ids) >= 512:
         try:
             # Convert to tensors for GPU processing
             key0_tensor = torch.tensor(key0.token_ids, dtype=torch.int64)
