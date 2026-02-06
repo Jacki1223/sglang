@@ -180,19 +180,6 @@ def _check_extra_key(key0: RadixKey, key1: RadixKey):
 
 def _key_match_page_size1(key0: RadixKey, key1: RadixKey):
     _check_extra_key(key0, key1)
-
-    # Use optimized Triton kernel for long sequences when available
-    if TRITON_AVAILABLE and len(key0.token_ids) >= 512:
-        try:
-            # Convert to tensors for GPU processing
-            key0_tensor = torch.tensor(key0.token_ids, dtype=torch.int64)
-            key1_tensor = torch.tensor(key1.token_ids, dtype=torch.int64)
-            return token_match_fast(key0_tensor, key1_tensor)
-        except Exception as e:
-            logger.debug(f"Triton kernel failed, falling back to Python: {e}")
-            # Fallback to Python implementation
-
-    # Original Python implementation (fallback or for short sequences)
     i = 0
     for k0, k1 in zip(key0.token_ids, key1.token_ids):
         if k0 != k1:
@@ -364,20 +351,27 @@ class RadixCache(BasePrefixCache):
 
         This method provides a drop-in replacement for _key_match_page_size1
         that uses GPU acceleration for better performance on long sequences.
+
+        NOTE: Currently disabled due to performance issues with tensor creation
+        and CPU-GPU transfer overhead. The threshold mismatch (128 vs 512) was
+        causing severe performance degradation for mid-length sequences.
         """
         _check_extra_key(key0, key1)
 
-        # Use Triton kernel for sequences >= 128 tokens
-        if len(key0.token_ids) >= 128 and len(key1.token_ids) >= 128:
-            try:
-                # Avoid repeated tensor creation by caching if possible
-                key0_tensor = torch.tensor(key0.token_ids, dtype=torch.int64)
-                key1_tensor = torch.tensor(key1.token_ids, dtype=torch.int64)
-                return token_match_fast(key0_tensor, key1_tensor)
-            except Exception as e:
-                logger.debug(f"Triton kernel failed, falling back to Python: {e}")
+        # DISABLED: Triton kernel optimization temporarily disabled
+        # The overhead of tensor creation and CPU-GPU transfer was causing
+        # performance issues for sequences in the 128-511 token range.
+        #
+        # Original code:
+        # if len(key0.token_ids) >= 128 and len(key1.token_ids) >= 128:
+        #     try:
+        #         key0_tensor = torch.tensor(key0.token_ids, dtype=torch.int64)
+        #         key1_tensor = torch.tensor(key1.token_ids, dtype=torch.int64)
+        #         return token_match_fast(key0_tensor, key1_tensor)
+        #     except Exception as e:
+        #         logger.debug(f"Triton kernel failed, falling back to Python: {e}")
 
-        # Fallback to Python for short sequences or on error
+        # Use Python implementation for all sequences (proven fast enough)
         i = 0
         for k0, k1 in zip(key0.token_ids, key1.token_ids):
             if k0 != k1:
