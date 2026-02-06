@@ -1,8 +1,11 @@
 """
-Tests for the fused GEMM1+Activation MoE kernel.
+Tests for the fused Activation+GEMM2 MoE kernel.
 
-Verifies that the fused kernel (GEMM1 + SiLU/GELU activation in one pass)
-produces results matching the original separate GEMM1 + Activation path.
+Verifies that the fused kernel (Activation + GEMM2 in one pass)
+produces results matching the original separate Activation + GEMM2 path.
+The fused kernel reads gate and up halves from intermediate_cache1,
+applies activation in registers during A-tile loading, then performs
+the standard GEMM2 dot product.
 """
 
 import os
@@ -17,8 +20,8 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
 
-class TestFusedMoEGemmAct(unittest.TestCase):
-    """Test fused GEMM1+Activation against the original separate path."""
+class TestFusedMoEActGemm2(unittest.TestCase):
+    """Test fused Activation+GEMM2 against the original separate path."""
 
     @classmethod
     def setUpClass(cls):
@@ -36,8 +39,8 @@ class TestFusedMoEGemmAct(unittest.TestCase):
         activation="silu",
         use_fused=True,
     ):
-        """Run fused_experts_impl with or without the fused GEMM+Act path."""
-        os.environ["SGLANG_FUSED_MOE_GEMM_ACT"] = "1" if use_fused else "0"
+        """Run fused_experts_impl with or without the fused Act+GEMM2 path."""
+        os.environ["SGLANG_FUSED_MOE_ACT_GEMM2"] = "1" if use_fused else "0"
         # Reimport to pick up env change
         import importlib
 
@@ -175,10 +178,10 @@ class TestFusedMoEGemmAct(unittest.TestCase):
         self._assert_close(result_fused, result_original, torch.bfloat16)
 
     def test_large_batch(self):
-        """Test with a large batch."""
+        """Test with a large batch (prefill scenario)."""
         torch.manual_seed(42)
         inputs = self._create_moe_inputs(
-            num_tokens=256,
+            num_tokens=1024,
             num_experts=8,
             hidden_size=256,
             intermediate_size=512,

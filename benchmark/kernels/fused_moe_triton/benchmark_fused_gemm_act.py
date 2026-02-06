@@ -1,16 +1,17 @@
 """
-Benchmark: Fused GEMM1+Activation vs Separate GEMM1 + Activation
+Benchmark: Fused Activation+GEMM2 vs Separate Activation + GEMM2
 
-This benchmark compares the performance of the fused GEMM1+Activation kernel
-(which eliminates the intermediate buffer between gate_up projection and
-activation) against the original separate GEMM1 + Activation approach.
+This benchmark compares the performance of the fused Activation+GEMM2 kernel
+(which eliminates the intermediate_cache2 buffer and separate activation kernel
+by fusing activation into GEMM2's A-tile loading) against the original separate
+Activation + GEMM2 approach.
 
 Usage:
     python benchmark/kernels/fused_moe_triton/benchmark_fused_gemm_act.py
 
 Environment variables:
-    SGLANG_FUSED_MOE_GEMM_ACT=1  Enable fused path (default)
-    SGLANG_FUSED_MOE_GEMM_ACT=0  Disable fused path (original)
+    SGLANG_FUSED_MOE_ACT_GEMM2=1  Enable fused path (default)
+    SGLANG_FUSED_MOE_ACT_GEMM2=0  Disable fused path (original)
 """
 
 import os
@@ -47,7 +48,7 @@ MODEL_CONFIGS = {
     },
 }
 
-BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1536, 2048]
 
 
 def benchmark_fused_moe(
@@ -61,9 +62,9 @@ def benchmark_fused_moe(
     num_warmup: int = 10,
     num_iters: int = 100,
 ) -> float:
-    """Run benchmark for fused MoE with or without GEMM+Act fusion."""
+    """Run benchmark for fused MoE with or without Act+GEMM2 fusion."""
     # Set the environment variable to control fusion
-    os.environ["SGLANG_FUSED_MOE_GEMM_ACT"] = "1" if use_fused else "0"
+    os.environ["SGLANG_FUSED_MOE_ACT_GEMM2"] = "1" if use_fused else "0"
 
     # Need to reimport to pick up the env var change
     import importlib
@@ -138,8 +139,12 @@ def main():
     set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
     print("=" * 80)
-    print("Fused GEMM1+Activation Benchmark")
+    print("Fused Activation+GEMM2 Benchmark")
     print("=" * 80)
+    print()
+    print("Approach: Fuse activation(gate)*up into GEMM2's A-tile loading.")
+    print("Benefits: Eliminates intermediate_cache2 + activation kernel launch.")
+    print("          Only 1 accumulator (same as original GEMM2). Works for all batch sizes.")
     print()
 
     for model_name, config in MODEL_CONFIGS.items():
@@ -164,8 +169,9 @@ def main():
                     **config,
                 )
                 speedup = time_original / time_fused if time_fused > 0 else float("inf")
+                marker = " <--" if speedup > 1.05 else (" !!!" if speedup < 0.95 else "")
                 print(
-                    f"{batch_size:>8} {time_original:>14.3f} {time_fused:>12.3f} {speedup:>9.2f}x"
+                    f"{batch_size:>8} {time_original:>14.3f} {time_fused:>12.3f} {speedup:>9.2f}x{marker}"
                 )
             except Exception as e:
                 print(f"{batch_size:>8} ERROR: {e}")

@@ -26,7 +26,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .fused_moe_triton_kernels import (
     act_and_mul_triton,
-    invoke_fused_moe_gemm_act_kernel,
+    invoke_fused_moe_act_gemm2_kernel,
     invoke_fused_moe_kernel,
     moe_sum_reduce_triton,
     support_tensor_descriptor,
@@ -59,21 +59,16 @@ elif _is_hip:
 
 padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
-# Enable fused GEMM1 + Activation kernel (default: enabled).
-# This fuses the gate_up projection GEMM with the activation function,
-# eliminating the intermediate buffer and reducing memory bandwidth.
-# Only beneficial when memory-bound (small token counts, i.e. decode).
-# For large token counts (prefill), the 2x weight loading overhead and
-# doubled register pressure makes the fused kernel slower.
-_use_fused_gemm_act = bool(int(os.getenv("SGLANG_FUSED_MOE_GEMM_ACT", "1")))
-
-# Token count threshold below which the fused GEMM1+Act kernel is used.
-# Below this threshold: memory-bound → fused kernel saves bandwidth → faster.
-# Above this threshold: compute-bound → original separate kernels → faster.
-# Can be tuned via environment variable. Default 128 works well for most models.
-_fused_gemm_act_token_threshold = int(
-    os.getenv("SGLANG_FUSED_MOE_GEMM_ACT_THRESHOLD", "128")
-)
+# Enable fused Activation + GEMM2 kernel (default: enabled).
+# This fuses the activation function (SiLU/GELU + gate*up multiply) into
+# GEMM2's A-tile loading prologue. Instead of a separate activation kernel
+# writing to intermediate_cache2, this reads gate and up halves directly from
+# intermediate_cache1, applies activation in registers, then performs GEMM2.
+# Benefits: eliminates intermediate_cache2 buffer and activation kernel launch,
+# only 1 accumulator (same register pressure as original GEMM2), works for all
+# batch sizes. Falls back to original path for quantized activations, non-gated
+# activations, or special activation variants (gemm1_alpha/limit).
+_use_fused_act_gemm2 = bool(int(os.getenv("SGLANG_FUSED_MOE_ACT_GEMM2", "1")))
 
 
 @register_custom_op(mutates_args=["hidden_states"])
@@ -462,93 +457,96 @@ def fused_experts_impl(
             curr_topk_ids, config["BLOCK_SIZE_M"], E
         )
 
-        # Determine if we can use the fused GEMM1+Activation path.
-        # The fused kernel loads B weights 2x (gate + up) per tile and uses
-        # 2x accumulators, which increases register pressure and weight
-        # bandwidth. This is only beneficial when the workload is memory-bound
-        # (small token count, i.e. decode). For large token counts (prefill),
-        # the original separate GEMM1 + activation is faster because the
-        # GEMM is compute-bound and the intermediate buffer cost is amortized.
-        use_fused_path = (
-            _use_fused_gemm_act
-            and tokens_in_chunk <= _fused_gemm_act_token_threshold
+        # --- GEMM1: gate_up projection (always runs) ---
+        intermediate_cache1 = cache[: total_tokens * N].view(
+            (total_tokens, N),
+        )
+
+        invoke_fused_moe_kernel(
+            curr_hidden_states,
+            w1,
+            b1,
+            intermediate_cache1,
+            a1_scale,
+            w1_scale,
+            w1_zp,
+            curr_topk_weights,
+            curr_topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            apply_router_weight_on_input,
+            topk_ids.shape[1],
+            config,
+            compute_type=compute_type,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            per_channel_quant=per_channel_quant,
+            block_shape=block_shape,
+            c_sorted=down_moe_use_tma,
+            filter_expert=filter_expert,
+        )
+
+        # --- Activation + GEMM2: fused or separate ---
+        # Determine if we can use the fused Activation+GEMM2 path.
+        # The fused kernel reads gate and up halves from intermediate_cache1,
+        # applies activation in registers during A-tile loading, then performs
+        # the standard GEMM2 dot product. This eliminates intermediate_cache2
+        # and the separate activation kernel launch.
+        # Only 1 accumulator (same as original GEMM2), minimal register overhead.
+        use_fused_act_gemm2 = (
+            _use_fused_act_gemm2
             and is_gated
             and gemm1_alpha is None
             and gemm1_limit is None
-            and not use_int8_w8a16
             and not use_int4_w4a16
             and (_is_cuda or _is_hip)
             and activation in ("silu", "gelu")
+            and not down_moe_use_tma  # TMA for A not supported in fused path
         )
 
-        if use_fused_path:
-            # Fused GEMM1 + Activation: skip intermediate_cache1 entirely.
-            # Write directly to intermediate_cache2 (N/2 width).
-            intermediate_cache2 = torch.empty(
-                (total_tokens, N // 2),
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-            )
-            invoke_fused_moe_gemm_act_kernel(
-                curr_hidden_states,
-                w1,
-                b1,
-                intermediate_cache2,
-                a1_scale,
-                w1_scale,
-                curr_topk_weights,
-                curr_topk_ids,
-                sorted_token_ids,
-                expert_ids,
-                num_tokens_post_padded,
-                apply_router_weight_on_input,
-                topk_ids.shape[1],
-                config,
-                compute_type=compute_type,
-                use_fp8_w8a8=use_fp8_w8a8,
-                use_int8_w8a8=use_int8_w8a8,
-                per_channel_quant=per_channel_quant,
-                block_shape=block_shape,
-                c_sorted=down_moe_use_tma,
-                filter_expert=filter_expert,
-                activation=activation,
-            )
-        else:
-            # Original path: separate GEMM1 + Activation
-            intermediate_cache1 = cache[: total_tokens * N].view(
-                (total_tokens, N),
-            )
-            intermediate_cache2 = torch.empty(
-                (total_tokens, N // 2),
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-            )
-
-            invoke_fused_moe_kernel(
-                curr_hidden_states,
-                w1,
-                b1,
+        if use_fused_act_gemm2:
+            # Fused Activation + GEMM2: read from intermediate_cache1 directly,
+            # apply activation in registers, skip intermediate_cache2 entirely.
+            invoke_fused_moe_act_gemm2_kernel(
                 intermediate_cache1,
-                a1_scale,
-                w1_scale,
-                w1_zp,
+                w2,
+                b2,
+                (
+                    intermediate_cache3
+                    if not no_combine and topk_ids.shape[1] != 1
+                    else out_hidden_states[begin_chunk_idx:end_chunk_idx].unsqueeze(0)
+                ),
+                a2_scale,
+                w2_scale,
+                w2_zp,
                 curr_topk_weights,
                 curr_topk_ids,
                 sorted_token_ids,
                 expert_ids,
                 num_tokens_post_padded,
-                apply_router_weight_on_input,
-                topk_ids.shape[1],
-                config,
+                not apply_router_weight_on_input,
+                1,
+                down_config or config,
                 compute_type=compute_type,
-                use_fp8_w8a8=use_fp8_w8a8,
-                use_int8_w8a8=use_int8_w8a8,
+                use_fp8_w8a8=False,  # A (intermediate_cache1) is BF16/FP16
+                use_int8_w8a8=False,
                 use_int8_w8a16=use_int8_w8a16,
                 use_int4_w4a16=use_int4_w4a16,
                 per_channel_quant=per_channel_quant,
                 block_shape=block_shape,
-                c_sorted=down_moe_use_tma,
+                c_sorted=False,
                 filter_expert=filter_expert,
+                activation=activation,
+            )
+        else:
+            # Original path: separate Activation + GEMM2
+            intermediate_cache2 = torch.empty(
+                (total_tokens, N // 2),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
             )
 
             # Activation function with multiplication
@@ -619,37 +617,37 @@ def fused_experts_impl(
                     f"Unsupported activation: {activation=}, with {is_gated=}"
                 )
 
-        invoke_fused_moe_kernel(
-            intermediate_cache2,
-            w2,
-            b2,
-            (
-                intermediate_cache3
-                if not no_combine and topk_ids.shape[1] != 1
-                else out_hidden_states[begin_chunk_idx:end_chunk_idx].unsqueeze(0)
-            ),
-            a2_scale,
-            w2_scale,
-            w2_zp,
-            curr_topk_weights,
-            curr_topk_ids,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            not apply_router_weight_on_input,
-            1,
-            down_config or config,
-            compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            use_int4_w4a16=use_int4_w4a16,
-            per_channel_quant=per_channel_quant,
-            block_shape=block_shape,
-            a_use_tma=down_moe_use_tma,
-            b_use_tma=down_moe_use_tma,
-            filter_expert=filter_expert,
-        )
+            invoke_fused_moe_kernel(
+                intermediate_cache2,
+                w2,
+                b2,
+                (
+                    intermediate_cache3
+                    if not no_combine and topk_ids.shape[1] != 1
+                    else out_hidden_states[begin_chunk_idx:end_chunk_idx].unsqueeze(0)
+                ),
+                a2_scale,
+                w2_scale,
+                w2_zp,
+                curr_topk_weights,
+                curr_topk_ids,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                not apply_router_weight_on_input,
+                1,
+                down_config or config,
+                compute_type=compute_type,
+                use_fp8_w8a8=use_fp8_w8a8,
+                use_int8_w8a8=use_int8_w8a8,
+                use_int8_w8a16=use_int8_w8a16,
+                use_int4_w4a16=use_int4_w4a16,
+                per_channel_quant=per_channel_quant,
+                block_shape=block_shape,
+                a_use_tma=down_moe_use_tma,
+                b_use_tma=down_moe_use_tma,
+                filter_expert=filter_expert,
+            )
 
         if routed_scaling_factor is None:
             routed_scaling_factor = 1.0
