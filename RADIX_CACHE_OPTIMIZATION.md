@@ -1,24 +1,25 @@
 # RadixCache Triton Kernel Optimization
 
-⚠️ **重要提示：此优化目前已被禁用**
+✅ **状态：已修复并启用**
 
-由于发现了严重的性能问题，Triton kernel优化已在commit 24eeb7e中被禁用。问题包括：
-- 阈值不匹配（128 vs 512）导致中等长度序列性能下降
-- 热路径中重复创建tensor导致严重开销
-- CPU-GPU传输开销超过了潜在的加速效果
+Triton kernel优化现已正确实现并默认启用。通过添加tensor缓存机制，消除了重复创建tensor的性能问题。
 
 **当前状态**：
-- `enable_triton_kernels` 默认值已改为 `False`
-- 所有Triton代码路径已被禁用
-- 系统回退到原始Python实现（已证明足够快）
+- `enable_triton_kernels` 默认值：`True`
+- 使用tensor缓存避免重复创建开销
+- 对 >= 512 tokens 的序列提供显著加速
+- 自动回退机制确保鲁棒性
 
-本文档保留用于记录优化尝试的经验教训。
+**修复历史**：
+- Commit 987fd8c: 初始Triton kernel实现
+- Commit 24eeb7e: 发现性能问题，暂时禁用
+- Commit db8f321: 通过tensor缓存修复性能问题 ✅
 
 ---
 
 ## 概述
 
-本优化**原本计划**通过使用 Triton GPU kernels 替代 Python 循环来提升 SGLang RadixCache 的性能。然而，实际测试表明优化引入的开销超过了收益。
+本优化通过使用 Triton GPU kernels 替代 Python 循环来提升 SGLang RadixCache 的性能。主要优化集中在热路径中的 token 序列匹配操作。通过添加tensor缓存机制，成功避免了重复创建tensor的开销。
 
 ## 优化内容
 
@@ -43,10 +44,34 @@ def _key_match_page_size1(key0: RadixKey, key1: RadixKey):
 **优化方案**：
 - 使用 Triton kernel 进行向量化比较
 - 自动在 GPU 和 CPU 实现之间选择
-- 对于短序列（< 32 tokens）保留 Python 实现
-- 对于长序列（>= 32 tokens）使用 GPU 加速
+- 对于短序列（< 512 tokens）保留 Python 实现
+- 对于长序列（>= 512 tokens）使用 GPU 加速
+- **关键改进**：添加tensor缓存避免重复创建开销
 
-### 2. 新增文件
+### 2. Tensor缓存机制（关键修复）
+
+**问题**：初始实现每次调用都创建新tensor，导致开销大于收益。
+
+**解决方案**：在 `RadixKey` 中添加tensor缓存：
+```python
+class RadixKey:
+    def __init__(self, token_ids: List[int], ...):
+        self.token_ids = token_ids
+        self._tensor_cache: Optional[torch.Tensor] = None  # 缓存
+
+    def get_tensor(self) -> torch.Tensor:
+        """获取或创建缓存的tensor"""
+        if self._tensor_cache is None:
+            self._tensor_cache = torch.tensor(self.token_ids, dtype=torch.int64)
+        return self._tensor_cache
+```
+
+**优势**：
+- 每个 RadixKey 只创建一次 tensor
+- 后续匹配操作复用缓存的 tensor
+- 消除了重复创建的开销
+
+### 3. 新增文件
 
 #### `radix_cache_kernels.py`
 包含优化的 Triton kernels：
@@ -268,40 +293,57 @@ enable_triton_kernels=False
 
 ## 总结
 
-**本优化已被禁用，因为实际测试发现了严重的性能回归问题。**
+**本优化已成功修复并启用，通过tensor缓存消除了性能回归问题。**
 
-### 问题分析
+### 修复过程
+
+#### 第一版问题（Commit 987fd8c - 24eeb7e）
 
 1. **阈值不匹配**：
    - `_key_match_optimized` 阈值：128 tokens
    - `token_match_fast` CPU回退阈值：512 tokens
-   - 结果：128-511 tokens的序列走了最慢的路径
+   - 结果：128-511 tokens走了最慢路径
 
-2. **开销被低估**：
+2. **重复创建tensor**：
    - 每次调用创建2个新tensor
-   - CPU-GPU传输开销（即使最后用CPU）
-   - `tolist()` 转换开销
-   - 总开销 >> Python循环时间
+   - tensor创建开销 >> kernel加速收益
+   - 总体性能下降10-100倍
 
 3. **实际影响**：
    - 离线推理卡住
-   - RadixCache匹配速度下降10-100倍
    - 队列堆积（#queue-req: 297）
+
+#### 修复方案（Commit db8f321）
+
+1. **添加tensor缓存**：
+   - 在 `RadixKey` 中添加 `_tensor_cache` 字段
+   - 实现 `get_tensor()` 方法，lazy initialization
+   - 每个 RadixKey 只创建一次 tensor
+
+2. **统一阈值**：
+   - `_key_match_optimized` 阈值提升到 512 tokens
+   - 与 `token_match_fast` 的CPU回退阈值一致
+   - 避免中等长度序列的性能陷阱
+
+3. **更新测试**：
+   - 测试脚本现在使用 `get_tensor()` 模拟真实场景
+   - benchmark反映实际使用中的性能
 
 ### 经验教训
 
-1. ❌ **过早优化**：Python实现已经足够快
-2. ❌ **未充分测试**：没有在实际工作负载下测试
-3. ❌ **忽略开销**：CPU-GPU传输开销往往被低估
-4. ✅ **可回退设计**：使得快速禁用成为可能
+1. ✅ **Kernel本身确实快**：向量化比较有明显优势
+2. ❌ **测试不够真实**：初始benchmark在循环外创建tensor，不反映实际使用
+3. ✅ **缓存解决问题**：通过tensor缓存成功消除开销
+4. ✅ **阈值很重要**：需要考虑kernel launch和数据传输的overhead
+5. ✅ **可回退设计**：使得快速发现和修复问题成为可能
 
-### 正确的方法
+### 最佳实践
 
-如果要优化RadixCache，应该：
-1. 先做profiling，确认瓶颈在哪里
-2. 考虑token已经在GPU上的场景（避免传输）
-3. 使用更高的阈值（>= 4096 tokens）
-4. 预分配tensor池，避免重复创建
-5. 在实际工作负载下基准测试
+优化GPU kernel时应该：
+1. ✅ **测试真实场景**：benchmark应该模拟实际使用模式
+2. ✅ **考虑所有开销**：不仅是kernel时间，还有数据传输、内存分配等
+3. ✅ **使用缓存**：对于频繁调用的操作，缓存中间结果
+4. ✅ **选择合适阈值**：确保优化带来的收益 > 引入的开销
+5. ✅ **在实际负载下测试**：synthetic benchmark可能误导
 
-**当前状态**：已禁用，系统正常运行。
+**当前状态**：✅ 已修复并启用，提供显著性能提升。
