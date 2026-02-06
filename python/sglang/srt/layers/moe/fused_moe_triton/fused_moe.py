@@ -26,6 +26,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .fused_moe_triton_kernels import (
     act_and_mul_triton,
+    invoke_fused_moe_gemm_act_kernel,
     invoke_fused_moe_kernel,
     moe_sum_reduce_triton,
     support_tensor_descriptor,
@@ -57,6 +58,11 @@ elif _is_hip:
         from vllm import _custom_ops as vllm_ops
 
 padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
+
+# Enable fused GEMM1 + Activation kernel (default: enabled).
+# This fuses the gate_up projection GEMM with the activation function,
+# eliminating the intermediate buffer and reducing memory bandwidth.
+_use_fused_gemm_act = bool(int(os.getenv("SGLANG_FUSED_MOE_GEMM_ACT", "1")))
 
 
 @register_custom_op(mutates_args=["hidden_states"])
@@ -437,14 +443,6 @@ def fused_experts_impl(
             else 0
         )
         total_tokens = tokens_in_chunk * topk + padded_tokens
-        intermediate_cache1 = cache[: total_tokens * N].view(
-            (total_tokens, N),
-        )
-        intermediate_cache2 = torch.empty(
-            (total_tokens, N // 2),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
 
         curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
         curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
@@ -453,92 +451,157 @@ def fused_experts_impl(
             curr_topk_ids, config["BLOCK_SIZE_M"], E
         )
 
-        invoke_fused_moe_kernel(
-            curr_hidden_states,
-            w1,
-            b1,
-            intermediate_cache1,
-            a1_scale,
-            w1_scale,
-            w1_zp,
-            curr_topk_weights,
-            curr_topk_ids,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            apply_router_weight_on_input,
-            topk_ids.shape[1],
-            config,
-            compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            use_int4_w4a16=use_int4_w4a16,
-            per_channel_quant=per_channel_quant,
-            block_shape=block_shape,
-            c_sorted=down_moe_use_tma,
-            filter_expert=filter_expert,
+        # Determine if we can use the fused GEMM1+Activation path.
+        # Conditions: gated activation, no special alpha/limit, no INT4/INT8_w8a16,
+        # CUDA or HIP platform, and the feature is enabled.
+        use_fused_path = (
+            _use_fused_gemm_act
+            and is_gated
+            and gemm1_alpha is None
+            and gemm1_limit is None
+            and not use_int8_w8a16
+            and not use_int4_w4a16
+            and (_is_cuda or _is_hip)
+            and activation in ("silu", "gelu")
         )
 
-        # Activation function with multiplication
-        if activation == "silu" and is_gated:
-            # - gemm1_alpha != None: GPT-OSS-style swiglu(alpha, limit)
-            # - gemm1_alpha == None and gemm1_limit != None: silu+clamp+mul(limit-only)
-            if gemm1_alpha is not None:
-                assert gemm1_limit is not None
-                intermediate_cache2 = _swiglu_gpt_oss_sigmoid_alpha(
-                    intermediate_cache1.view(-1, N), gemm1_alpha, gemm1_limit
-                )
-            elif gemm1_limit is not None:
-                intermediate_cache2 = _swiglu_silu_clamp_mul(
-                    intermediate_cache1.view(-1, N), gemm1_limit
-                )
-            elif _is_cuda or _is_hip:
-                if not filter_expert:
-                    silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-                else:
-                    act_and_mul_triton(
-                        intermediate_cache1.view(-1, N),
-                        intermediate_cache2,
-                        config,
-                        topk_ids,
-                        expert_ids,
-                        down_moe_use_tma,
-                        activation,
-                    )
-            else:
-                vllm_ops.silu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
-                )
-        elif activation == "gelu" and is_gated:
-            assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
-            assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
-            if _is_cuda or _is_hip:
-                if not filter_expert:
-                    gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-                else:
-                    act_and_mul_triton(
-                        intermediate_cache1.view(-1, N),
-                        intermediate_cache2,
-                        config,
-                        topk_ids,
-                        expert_ids,
-                        down_moe_use_tma,
-                        activation,
-                    )
-            else:
-                vllm_ops.gelu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
-                )
-        # Activation function without multiplication
-        elif activation == "silu" and not is_gated:
-            intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
-        elif activation == "gelu" and not is_gated:
-            intermediate_cache2 = F.gelu(intermediate_cache1.view(-1, N))
-        elif activation == "relu2" and not is_gated:
-            intermediate_cache2 = torch.square(F.relu(intermediate_cache1.view(-1, N)))
+        if use_fused_path:
+            # Fused GEMM1 + Activation: skip intermediate_cache1 entirely.
+            # Write directly to intermediate_cache2 (N/2 width).
+            intermediate_cache2 = torch.empty(
+                (total_tokens, N // 2),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            invoke_fused_moe_gemm_act_kernel(
+                curr_hidden_states,
+                w1,
+                b1,
+                intermediate_cache2,
+                a1_scale,
+                w1_scale,
+                curr_topk_weights,
+                curr_topk_ids,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                apply_router_weight_on_input,
+                topk_ids.shape[1],
+                config,
+                compute_type=compute_type,
+                use_fp8_w8a8=use_fp8_w8a8,
+                use_int8_w8a8=use_int8_w8a8,
+                per_channel_quant=per_channel_quant,
+                block_shape=block_shape,
+                c_sorted=down_moe_use_tma,
+                filter_expert=filter_expert,
+                activation=activation,
+            )
         else:
-            raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
+            # Original path: separate GEMM1 + Activation
+            intermediate_cache1 = cache[: total_tokens * N].view(
+                (total_tokens, N),
+            )
+            intermediate_cache2 = torch.empty(
+                (total_tokens, N // 2),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+
+            invoke_fused_moe_kernel(
+                curr_hidden_states,
+                w1,
+                b1,
+                intermediate_cache1,
+                a1_scale,
+                w1_scale,
+                w1_zp,
+                curr_topk_weights,
+                curr_topk_ids,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                apply_router_weight_on_input,
+                topk_ids.shape[1],
+                config,
+                compute_type=compute_type,
+                use_fp8_w8a8=use_fp8_w8a8,
+                use_int8_w8a8=use_int8_w8a8,
+                use_int8_w8a16=use_int8_w8a16,
+                use_int4_w4a16=use_int4_w4a16,
+                per_channel_quant=per_channel_quant,
+                block_shape=block_shape,
+                c_sorted=down_moe_use_tma,
+                filter_expert=filter_expert,
+            )
+
+            # Activation function with multiplication
+            if activation == "silu" and is_gated:
+                # - gemm1_alpha != None: GPT-OSS-style swiglu(alpha, limit)
+                # - gemm1_alpha == None and gemm1_limit != None: silu+clamp+mul(limit-only)
+                if gemm1_alpha is not None:
+                    assert gemm1_limit is not None
+                    intermediate_cache2 = _swiglu_gpt_oss_sigmoid_alpha(
+                        intermediate_cache1.view(-1, N), gemm1_alpha, gemm1_limit
+                    )
+                elif gemm1_limit is not None:
+                    intermediate_cache2 = _swiglu_silu_clamp_mul(
+                        intermediate_cache1.view(-1, N), gemm1_limit
+                    )
+                elif _is_cuda or _is_hip:
+                    if not filter_expert:
+                        silu_and_mul(
+                            intermediate_cache1.view(-1, N), intermediate_cache2
+                        )
+                    else:
+                        act_and_mul_triton(
+                            intermediate_cache1.view(-1, N),
+                            intermediate_cache2,
+                            config,
+                            topk_ids,
+                            expert_ids,
+                            down_moe_use_tma,
+                            activation,
+                        )
+                else:
+                    vllm_ops.silu_and_mul(
+                        intermediate_cache2, intermediate_cache1.view(-1, N)
+                    )
+            elif activation == "gelu" and is_gated:
+                assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
+                assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
+                if _is_cuda or _is_hip:
+                    if not filter_expert:
+                        gelu_and_mul(
+                            intermediate_cache1.view(-1, N), intermediate_cache2
+                        )
+                    else:
+                        act_and_mul_triton(
+                            intermediate_cache1.view(-1, N),
+                            intermediate_cache2,
+                            config,
+                            topk_ids,
+                            expert_ids,
+                            down_moe_use_tma,
+                            activation,
+                        )
+                else:
+                    vllm_ops.gelu_and_mul(
+                        intermediate_cache2, intermediate_cache1.view(-1, N)
+                    )
+            # Activation function without multiplication
+            elif activation == "silu" and not is_gated:
+                intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
+            elif activation == "gelu" and not is_gated:
+                intermediate_cache2 = F.gelu(intermediate_cache1.view(-1, N))
+            elif activation == "relu2" and not is_gated:
+                intermediate_cache2 = torch.square(
+                    F.relu(intermediate_cache1.view(-1, N))
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported activation: {activation=}, with {is_gated=}"
+                )
 
         invoke_fused_moe_kernel(
             intermediate_cache2,

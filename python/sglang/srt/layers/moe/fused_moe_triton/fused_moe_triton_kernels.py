@@ -1087,3 +1087,455 @@ def fused_append_shared_experts(
         num_warps=1,
     )
     return out_ids, out_weights
+
+
+# ============================================================================
+# Fused GEMM1 + Activation Kernel
+# ============================================================================
+# This kernel fuses the gate_up GEMM (hidden × w13) with the activation
+# function (SiLU/GELU + gate*up multiply). Each tile computes both gate and
+# up projections for a block of output columns, applies the activation in
+# the epilogue, and writes directly to the down-projection input buffer.
+# This eliminates the intermediate_cache1 buffer entirely, saving
+# 2 × total_tokens × N × dtype_size bytes of memory bandwidth.
+# ============================================================================
+
+
+@triton.jit
+def fused_moe_gemm_act_kernel(
+    # Pointers to matrices
+    a_ptr,
+    b_ptr,
+    bias_ptr,
+    c_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    # Matrix dimensions
+    N,  # full gate+up width (2 * intermediate_size)
+    K,  # hidden_size
+    EM,  # total sorted tokens
+    num_valid_tokens,
+    # Strides for A
+    stride_am,
+    stride_ak,
+    # Strides for B
+    stride_be,
+    stride_bk,
+    stride_bn,
+    # Strides for bias
+    stride_bias_e,
+    stride_bias_n,
+    # Strides for C (output, half width)
+    stride_cm,
+    stride_cn,
+    # Strides for scales
+    stride_asm,
+    stride_ask,
+    stride_bse,
+    stride_bsk,
+    stride_bsn,
+    # Block-wise quantization shape
+    group_n: tl.constexpr,
+    group_k: tl.constexpr,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,  # in terms of output (N/2) columns
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+    use_fp8_w8a8: tl.constexpr,
+    use_int8_w8a8: tl.constexpr,
+    per_channel_quant: tl.constexpr,
+    even_Ks: tl.constexpr,
+    c_sorted: tl.constexpr,
+    filter_expert: tl.constexpr,
+    ACTIVATION_TYPE: tl.constexpr,
+):
+    """
+    Fused GEMM1 + Activation kernel for Mixture of Experts.
+
+    For each tile of tokens (BLOCK_SIZE_M) and output columns (BLOCK_SIZE_N),
+    computes both the gate and up projections by loading the shared input A
+    once and loading both halves of B (gate weights from first N/2 cols,
+    up weights from last N/2 cols). Applies activation in the epilogue:
+      output = activation(gate_result) * up_result
+
+    This eliminates the intermediate buffer between GEMM1 and activation.
+    """
+    half_N = N // 2
+
+    # Map program ids to output tile
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(half_N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # Early exit for out-of-bounds tiles
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+
+    # Load token indices and expert assignment
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+    offs_token = offs_token.to(tl.int64)
+    token_mask = offs_token < num_valid_tokens
+
+    off_experts_i32 = tl.load(expert_ids_ptr + pid_m)
+    off_experts = off_experts_i32.to(tl.int64)
+
+    if filter_expert and off_experts == -1:
+        # Write zeros for filtered experts
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        zero_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=compute_type)
+        if c_sorted:
+            c_ptrs = (
+                c_ptr
+                + stride_cm * offs_token_id[:, None]
+                + stride_cn * offs_cn[None, :]
+            )
+        else:
+            c_ptrs = (
+                c_ptr
+                + stride_cm * offs_token[:, None]
+                + stride_cn * offs_cn[None, :]
+            )
+        c_mask = token_mask[:, None] & (offs_cn[None, :] < half_N)
+        tl.store(c_ptrs, zero_acc, mask=c_mask)
+        return
+
+    # Column offsets for output (N/2 columns)
+    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % half_N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    # Input A pointers
+    a_ptrs = a_ptr + (
+        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
+    )
+
+    # B gate pointers (first half: columns 0..N/2-1)
+    b_gate_ptrs = (
+        b_ptr
+        + off_experts * stride_be
+        + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+    )
+    # B up pointers (second half: columns N/2..N-1)
+    b_up_ptrs = (
+        b_ptr
+        + off_experts * stride_be
+        + (offs_k[:, None] * stride_bk + (offs_n[None, :] + half_N) * stride_bn)
+    )
+
+    # Load bias if present
+    if bias_ptr is not None:
+        bias_gate = tl.load(
+            bias_ptr + off_experts * stride_bias_e + offs_n[None, :] * stride_bias_n
+        )
+        bias_up = tl.load(
+            bias_ptr
+            + off_experts * stride_bias_e
+            + (offs_n[None, :] + half_N) * stride_bias_n
+        )
+
+    # Load scales for quantized paths
+    if use_fp8_w8a8 or use_int8_w8a8:
+        if group_k > 0 and group_n > 0:
+            # Block-wise quantization
+            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+            if BLOCK_SIZE_N > group_n:
+                offs_bsn_gate = offs_n // group_n
+                offs_bsn_up = (offs_n + half_N) // group_n
+            else:
+                offs_bsn_gate = pid_n * BLOCK_SIZE_N // group_n
+                offs_bsn_up = (pid_n * BLOCK_SIZE_N + half_N) // group_n
+            b_scale_gate_ptrs = (
+                b_scale_ptr + off_experts * stride_bse + offs_bsn_gate * stride_bsn
+            )
+            b_scale_up_ptrs = (
+                b_scale_ptr + off_experts * stride_bse + offs_bsn_up * stride_bsn
+            )
+        elif per_channel_quant:
+            # Per-channel quantization
+            b_scale_gate_ptrs = (
+                b_scale_ptr
+                + off_experts * stride_bse
+                + offs_n[None, :] * stride_bsn
+            )
+            b_scale_up_ptrs = (
+                b_scale_ptr
+                + off_experts * stride_bse
+                + (offs_n[None, :] + half_N) * stride_bsn
+            )
+            b_scale_gate = tl.load(b_scale_gate_ptrs)
+            b_scale_up = tl.load(b_scale_up_ptrs)
+            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+            a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
+        else:
+            # Tensor-wise quantization
+            a_scale = tl.load(a_scale_ptr)
+            b_scale_gate = tl.load(b_scale_ptr + off_experts)
+            b_scale_up = b_scale_gate  # same scale for both halves in tensor-wise
+
+    # Accumulate gate and up projections
+    acc_gate = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    acc_up = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for k_start in range(0, K, BLOCK_SIZE_K):
+        # Load A tile (shared between gate and up)
+        if even_Ks:
+            a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+        else:
+            a = tl.load(
+                a_ptrs,
+                mask=token_mask[:, None] & (offs_k[None, :] < K - k_start),
+                other=0.0,
+            )
+
+        # Load B gate and up tiles
+        if even_Ks:
+            b_gate = tl.load(b_gate_ptrs)
+            b_up = tl.load(b_up_ptrs)
+        else:
+            k_mask = offs_k[:, None] < K - k_start
+            b_gate = tl.load(b_gate_ptrs, mask=k_mask, other=0.0)
+            b_up = tl.load(b_up_ptrs, mask=k_mask, other=0.0)
+
+        # Accumulate
+        if use_fp8_w8a8 or use_int8_w8a8:
+            if group_k > 0 and group_n > 0:
+                offs_ks = k_start // group_k
+                a_scale = tl.load(
+                    a_scale_ptrs + offs_ks * stride_ask,
+                    mask=token_mask,
+                    other=0.0,
+                )
+                b_scale_gate = tl.load(
+                    b_scale_gate_ptrs + offs_ks * stride_bsk
+                )
+                b_scale_up = tl.load(
+                    b_scale_up_ptrs + offs_ks * stride_bsk
+                )
+                if BLOCK_SIZE_N > group_n:
+                    acc_gate += (
+                        tl.dot(a, b_gate)
+                        * a_scale[:, None]
+                        * b_scale_gate[None, :]
+                    )
+                    acc_up += (
+                        tl.dot(a, b_up)
+                        * a_scale[:, None]
+                        * b_scale_up[None, :]
+                    )
+                else:
+                    acc_gate += tl.dot(a, b_gate) * (a_scale[:, None] * b_scale_gate)
+                    acc_up += tl.dot(a, b_up) * (a_scale[:, None] * b_scale_up)
+            else:
+                if use_fp8_w8a8:
+                    acc_gate = tl.dot(a, b_gate, acc=acc_gate)
+                    acc_up = tl.dot(a, b_up, acc=acc_up)
+                else:
+                    acc_gate += tl.dot(a, b_gate)
+                    acc_up += tl.dot(a, b_up)
+        else:
+            acc_gate += tl.dot(a, b_gate)
+            acc_up += tl.dot(a, b_up)
+
+        # Advance pointers
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_gate_ptrs += BLOCK_SIZE_K * stride_bk
+        b_up_ptrs += BLOCK_SIZE_K * stride_bk
+
+    # Apply scales for non-blockwise quantization
+    if use_fp8_w8a8 or use_int8_w8a8:
+        if group_k == 0 or group_n == 0:
+            if per_channel_quant:
+                acc_gate *= a_scale * b_scale_gate
+                acc_up *= a_scale * b_scale_up
+            else:
+                acc_gate *= a_scale * b_scale_gate
+                acc_up *= a_scale * b_scale_up
+
+    # Apply bias
+    if bias_ptr is not None:
+        acc_gate += bias_gate
+        acc_up += bias_up
+
+    # Apply router weight before activation (when apply_router_weight_on_input)
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
+        acc_gate = acc_gate * moe_weight[:, None]
+        acc_up = acc_up * moe_weight[:, None]
+
+    # Fused activation: activation(gate) * up
+    if ACTIVATION_TYPE == "silu":
+        gate_activated = acc_gate * tl.sigmoid(acc_gate)
+    elif ACTIVATION_TYPE == "gelu":
+        kAlpha = 0.7978845608028654
+        gate_activated = 0.5 * acc_gate * (
+            1.0 + tanh(kAlpha * (acc_gate + 0.044715 * acc_gate * acc_gate * acc_gate))
+        )
+
+    result = (gate_activated * acc_up).to(compute_type)
+
+    # Write output (N/2 columns)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    if c_sorted:
+        c_ptrs = (
+            c_ptr + stride_cm * offs_token_id[:, None] + stride_cn * offs_cn[None, :]
+        )
+    else:
+        c_ptrs = (
+            c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+        )
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < half_N)
+    tl.store(c_ptrs, result, mask=c_mask)
+
+
+def invoke_fused_moe_gemm_act_kernel(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    C: torch.Tensor,
+    A_scale: Optional[torch.Tensor],
+    B_scale: Optional[torch.Tensor],
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    top_k: int,
+    config: Dict[str, Any],
+    compute_type: tl.dtype,
+    use_fp8_w8a8: bool,
+    use_int8_w8a8: bool,
+    per_channel_quant: bool,
+    block_shape: Optional[List[int]] = None,
+    c_sorted: bool = False,
+    filter_expert: bool = True,
+    activation: str = "silu",
+) -> None:
+    """
+    Wrapper for the fused GEMM1 + activation kernel.
+
+    Fuses gate_up GEMM (hidden × w13) with SiLU/GELU activation,
+    writing directly to the down-projection input buffer (N/2 width).
+
+    Args:
+        A: Input hidden states [M, K] (or quantized)
+        B: Expert weights [E, N, K] where N = 2 * intermediate_size
+        bias: Optional bias [E, N]
+        C: Output buffer [total_tokens, N/2]
+        A_scale: Activation quantization scale
+        B_scale: Weight quantization scale
+        topk_weights: Router weights
+        topk_ids: Expert assignments
+        sorted_token_ids: Sorted token indices for expert routing
+        expert_ids: Expert ID per block
+        num_tokens_post_padded: Total tokens after padding
+        mul_routed_weight: Whether to multiply by router weight
+        top_k: Number of top experts per token
+        config: Triton kernel configuration
+        activation: Activation type ("silu" or "gelu")
+    """
+    assert topk_weights.stride(1) == 1
+    assert sorted_token_ids.stride(0) == 1
+
+    N_full = B.shape[1]  # Full N (gate + up)
+
+    padded_size = 0
+    if use_fp8_w8a8:
+        assert B_scale is not None
+        if block_shape is None:
+            padded_size = padding_size
+            A, A_scale = scaled_fp8_quant(
+                A, A_scale, use_per_token_if_dynamic=per_channel_quant
+            )
+        else:
+            assert len(block_shape) == 2
+            block_k = block_shape[1]
+            if _is_cuda:
+                A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
+            else:
+                A, A_scale = per_token_group_quant_fp8(A, block_k)
+    elif use_int8_w8a8:
+        assert B_scale is not None
+        if block_shape is None:
+            assert per_channel_quant
+            A, A_scale = per_token_quant_int8(A)
+        else:
+            assert len(block_shape) == 2
+            block_k = block_shape[1]
+            if _is_cuda:
+                A, A_scale = sglang_per_token_group_quant_int8(A, block_k)
+            else:
+                A, A_scale = per_token_group_quant_int8(A, block_k)
+    else:
+        assert A_scale is None
+        assert B_scale is None
+
+    K = B.shape[2] - padded_size
+    half_N = N_full // 2
+
+    # Grid over output tiles: M blocks × (N/2) blocks
+    grid = lambda META: (
+        triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
+        * triton.cdiv(half_N, META["BLOCK_SIZE_N"]),
+    )
+
+    even_Ks = K % config["BLOCK_SIZE_K"] == 0
+
+    fused_moe_gemm_act_kernel[grid](
+        A,
+        B,
+        bias,
+        C,
+        A_scale,
+        B_scale,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        N_full,
+        K,
+        sorted_token_ids.shape[0],
+        topk_ids.numel(),
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(2),
+        B.stride(1),
+        bias.stride(0) if bias is not None else 0,
+        bias.stride(1) if bias is not None else 0,
+        C.stride(0),
+        C.stride(1),
+        A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
+        A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
+        B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
+        B_scale.stride(2) if B_scale is not None and B_scale.ndim == 3 else 0,
+        B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
+        0 if block_shape is None else block_shape[0],
+        0 if block_shape is None else block_shape[1],
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        top_k=top_k,
+        compute_type=compute_type,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
+        per_channel_quant=per_channel_quant,
+        even_Ks=even_Ks,
+        c_sorted=c_sorted,
+        filter_expert=filter_expert,
+        ACTIVATION_TYPE=activation,
+        **config,
+    )
