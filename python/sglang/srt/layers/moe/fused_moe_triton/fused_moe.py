@@ -62,7 +62,18 @@ padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 # Enable fused GEMM1 + Activation kernel (default: enabled).
 # This fuses the gate_up projection GEMM with the activation function,
 # eliminating the intermediate buffer and reducing memory bandwidth.
+# Only beneficial when memory-bound (small token counts, i.e. decode).
+# For large token counts (prefill), the 2x weight loading overhead and
+# doubled register pressure makes the fused kernel slower.
 _use_fused_gemm_act = bool(int(os.getenv("SGLANG_FUSED_MOE_GEMM_ACT", "1")))
+
+# Token count threshold below which the fused GEMM1+Act kernel is used.
+# Below this threshold: memory-bound → fused kernel saves bandwidth → faster.
+# Above this threshold: compute-bound → original separate kernels → faster.
+# Can be tuned via environment variable. Default 128 works well for most models.
+_fused_gemm_act_token_threshold = int(
+    os.getenv("SGLANG_FUSED_MOE_GEMM_ACT_THRESHOLD", "128")
+)
 
 
 @register_custom_op(mutates_args=["hidden_states"])
@@ -452,10 +463,15 @@ def fused_experts_impl(
         )
 
         # Determine if we can use the fused GEMM1+Activation path.
-        # Conditions: gated activation, no special alpha/limit, no INT4/INT8_w8a16,
-        # CUDA or HIP platform, and the feature is enabled.
+        # The fused kernel loads B weights 2x (gate + up) per tile and uses
+        # 2x accumulators, which increases register pressure and weight
+        # bandwidth. This is only beneficial when the workload is memory-bound
+        # (small token count, i.e. decode). For large token counts (prefill),
+        # the original separate GEMM1 + activation is faster because the
+        # GEMM is compute-bound and the intermediate buffer cost is amortized.
         use_fused_path = (
             _use_fused_gemm_act
+            and tokens_in_chunk <= _fused_gemm_act_token_threshold
             and is_gated
             and gemm1_alpha is None
             and gemm1_limit is None
