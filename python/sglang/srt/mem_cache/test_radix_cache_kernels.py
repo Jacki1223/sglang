@@ -98,15 +98,15 @@ def benchmark_token_match():
         print("Skipping benchmark: Triton or CUDA not available")
         return
 
-    print("\nBenchmarking token matching performance...")
-    print(f"{'Sequence Length':<20} {'Python (ms)':<15} {'Triton (ms)':<15} {'Speedup':<10}")
+    print("\nBenchmarking token matching performance (with tensor caching)...")
+    print(f"{'Seq Len':<10} {'Python (ms)':<15} {'Triton+Cache (ms)':<20} {'Speedup':<10}")
     print("-" * 70)
 
-    sequence_lengths = [32, 64, 128, 256, 512, 1024, 2048]
+    sequence_lengths = [128, 256, 512, 1024, 2048, 4096]
     num_iterations = 100
 
     for seq_len in sequence_lengths:
-        # Generate test data
+        # Generate test data - same keys used repeatedly (simulates caching)
         key0_tokens = list(range(seq_len))
         key1_tokens = list(range(seq_len))
         key0 = RadixKey(token_ids=key0_tokens, extra_key=None)
@@ -118,26 +118,39 @@ def benchmark_token_match():
             _key_match_page_size1(key0, key1)
         python_time = (time.perf_counter() - start_time) * 1000  # Convert to ms
 
-        # Benchmark Triton implementation
-        key0_tensor = torch.tensor(key0_tokens, dtype=torch.int64).cuda()
-        key1_tensor = torch.tensor(key1_tokens, dtype=torch.int64).cuda()
-
-        # Warmup
+        # Benchmark Triton implementation with cached tensors
+        # Warmup - this creates the cache
         for _ in range(10):
+            key0_tensor = key0.get_tensor()
+            key1_tensor = key1.get_tensor()
+            if not key0_tensor.is_cuda:
+                key0_tensor = key0_tensor.cuda()
+            if not key1_tensor.is_cuda:
+                key1_tensor = key1_tensor.cuda()
             token_match_fast(key0_tensor, key1_tensor)
 
         torch.cuda.synchronize()
         start_time = time.perf_counter()
         for _ in range(num_iterations):
+            # Use cached tensors (realistic scenario)
+            key0_tensor = key0.get_tensor()
+            key1_tensor = key1.get_tensor()
+            if not key0_tensor.is_cuda:
+                key0_tensor = key0_tensor.cuda()
+            if not key1_tensor.is_cuda:
+                key1_tensor = key1_tensor.cuda()
             token_match_fast(key0_tensor, key1_tensor)
         torch.cuda.synchronize()
         triton_time = (time.perf_counter() - start_time) * 1000  # Convert to ms
 
         speedup = python_time / triton_time if triton_time > 0 else float("inf")
+        status = "✅" if speedup > 1.0 else "⚠️"
 
         print(
-            f"{seq_len:<20} {python_time:<15.3f} {triton_time:<15.3f} {speedup:<10.2f}x"
+            f"{seq_len:<10} {python_time:<15.3f} {triton_time:<20.3f} {speedup:<10.2f}x {status}"
         )
+
+    print("\nNote: Benchmark uses cached tensors (get_tensor()) to reflect real usage")
 
 
 def test_radix_cache_integration():

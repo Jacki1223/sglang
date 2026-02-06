@@ -91,6 +91,14 @@ class RadixKey:
         self.extra_key = extra_key
         # is bigram key
         self.is_bigram = is_bigram
+        # cached tensor for GPU operations (lazy init)
+        self._tensor_cache: Optional[torch.Tensor] = None
+
+    def get_tensor(self) -> torch.Tensor:
+        """Get or create cached tensor representation of token_ids."""
+        if self._tensor_cache is None:
+            self._tensor_cache = torch.tensor(self.token_ids, dtype=torch.int64)
+        return self._tensor_cache
 
     def __len__(self) -> int:
         return len(self.token_ids)
@@ -352,26 +360,22 @@ class RadixCache(BasePrefixCache):
         This method provides a drop-in replacement for _key_match_page_size1
         that uses GPU acceleration for better performance on long sequences.
 
-        NOTE: Currently disabled due to performance issues with tensor creation
-        and CPU-GPU transfer overhead. The threshold mismatch (128 vs 512) was
-        causing severe performance degradation for mid-length sequences.
+        Uses cached tensors to avoid repeated tensor creation overhead.
         """
         _check_extra_key(key0, key1)
 
-        # DISABLED: Triton kernel optimization temporarily disabled
-        # The overhead of tensor creation and CPU-GPU transfer was causing
-        # performance issues for sequences in the 128-511 token range.
-        #
-        # Original code:
-        # if len(key0.token_ids) >= 128 and len(key1.token_ids) >= 128:
-        #     try:
-        #         key0_tensor = torch.tensor(key0.token_ids, dtype=torch.int64)
-        #         key1_tensor = torch.tensor(key1.token_ids, dtype=torch.int64)
-        #         return token_match_fast(key0_tensor, key1_tensor)
-        #     except Exception as e:
-        #         logger.debug(f"Triton kernel failed, falling back to Python: {e}")
+        # Use Triton kernel for long sequences (>= 512 tokens)
+        # This threshold ensures tensor creation overhead is amortized
+        if len(key0.token_ids) >= 512 and len(key1.token_ids) >= 512:
+            try:
+                # Use cached tensors to avoid repeated creation
+                key0_tensor = key0.get_tensor()
+                key1_tensor = key1.get_tensor()
+                return token_match_fast(key0_tensor, key1_tensor)
+            except Exception as e:
+                logger.debug(f"Triton kernel failed, falling back to Python: {e}")
 
-        # Use Python implementation for all sequences (proven fast enough)
+        # Use Python implementation for short sequences
         i = 0
         for k0, k1 in zip(key0.token_ids, key1.token_ids):
             if k0 != k1:
