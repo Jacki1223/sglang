@@ -501,6 +501,9 @@ def fused_experts_impl(
             and is_gated
             and gemm1_alpha is None
             and gemm1_limit is None
+            and not use_fp8_w8a8  # FP8 w2 needs FP8 A for tl.dot; fused A is BF16
+            and not use_int8_w8a8  # INT8 w2 needs INT8 A for tl.dot
+            and not use_int8_w8a16
             and not use_int4_w4a16
             and (_is_cuda or _is_hip)
             and activation in ("silu", "gelu")
@@ -531,10 +534,10 @@ def fused_experts_impl(
                 1,
                 down_config or config,
                 compute_type=compute_type,
-                use_fp8_w8a8=False,  # A (intermediate_cache1) is BF16/FP16
-                use_int8_w8a8=False,
-                use_int8_w8a16=use_int8_w8a16,
-                use_int4_w4a16=use_int4_w4a16,
+                use_fp8_w8a8=False,  # guarded by use_fused_act_gemm2 condition
+                use_int8_w8a8=False,  # guarded by use_fused_act_gemm2 condition
+                use_int8_w8a16=False,  # guarded by use_fused_act_gemm2 condition
+                use_int4_w4a16=False,  # guarded by use_fused_act_gemm2 condition
                 per_channel_quant=per_channel_quant,
                 block_shape=block_shape,
                 c_sorted=False,
