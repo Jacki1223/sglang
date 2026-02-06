@@ -108,8 +108,8 @@ class RadixKey:
 
     def __getitem__(self, idx: Union[int, slice]) -> "RadixKey":
         if isinstance(idx, slice):
-            return RadixKey(self.token_ids[idx], self.extra_key)
-        return RadixKey([self.token_ids[idx]], self.extra_key)
+            return RadixKey(self.token_ids[idx], self.extra_key, self.is_bigram)
+        return RadixKey([self.token_ids[idx]], self.extra_key, self.is_bigram)
 
     def __repr__(self) -> str:
         preview = self.token_ids[:10]
@@ -401,6 +401,8 @@ class RadixCache(BasePrefixCache):
     ) -> Tuple[RadixKey, Optional[torch.Tensor]]:
         if self.is_eagle and not key.is_bigram:
             key.token_ids = convert_to_bigram_key(key.token_ids)
+            # Invalidate tensor cache since token_ids changed
+            key._tensor_cache = None
             if value is not None:
                 value = value[: len(key)]
 
