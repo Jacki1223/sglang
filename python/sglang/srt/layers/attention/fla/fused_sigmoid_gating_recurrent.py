@@ -89,18 +89,19 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             )
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
+    # Hoist loop-invariant loads: A_log and dt_bias are constant across timesteps
+    b_A_log = tl.load(p_A_log).to(tl.float32)
+    b_neg_exp_A = -tl.exp(b_A_log)
+    b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
+    inv_softplus_beta = 1.0 / softplus_beta
+
     for _ in range(0, T):
-        # Load inputs
+        # Load per-timestep inputs (grouped for concurrent memory issue)
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
         b_b = tl.load(p_b).to(tl.float32)
-
-        # Compute sigmoid gating
-        # Load gating parameters
-        b_A_log = tl.load(p_A_log).to(tl.float32)
         b_a = tl.load(p_a).to(tl.float32)
-        b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
 
         # Compute g = -exp(A_log) * softplus(a + dt_bias)
         x = b_a + b_dt_bias
@@ -108,10 +109,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Apply softplus with numerical stability
         softplus_x = tl.where(
             beta_x <= softplus_threshold,
-            (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
+            inv_softplus_beta * tl.log(1.0 + tl.exp(beta_x)),
             x,
         )
-        b_g = -tl.exp(b_A_log) * softplus_x
+        b_g = b_neg_exp_A * softplus_x
 
         # Compute beta = sigmoid(b)
         b_beta = 1.0 / (1.0 + tl.exp(-b_b))
