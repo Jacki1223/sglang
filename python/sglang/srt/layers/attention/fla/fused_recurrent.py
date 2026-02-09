@@ -139,7 +139,9 @@ def fused_recurrent_gated_delta_rule_fwd(
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
-    num_stages = 3
+    # num_stages=1: recurrent kernel with loop-carried dependency on b_h,
+    # multi-stage pipelining cannot help and only wastes registers.
+    num_stages = 1
     num_warps = 1
 
     o = q.new_empty(NK, *v.shape)
@@ -543,7 +545,9 @@ def fused_recurrent_gated_delta_rule_update_fwd(
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 8)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
-    num_stages = 3
+    # num_stages=1: recurrent kernel with loop-carried dependency on b_h,
+    # multi-stage pipelining cannot help and only wastes registers.
+    num_stages = 1
     num_warps = 1
 
     if disable_output_calculation:

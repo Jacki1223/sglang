@@ -148,7 +148,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         p_o += HV * V
         p_v += HV * V
         p_b += HV
-        p_a += HV
+        if IS_KDA:
+            p_a += HV * K
+        else:
+            p_a += HV
 
     # Store final state back to h0_source with bounds checking
     if USE_INITIAL_STATE:
@@ -193,7 +196,11 @@ def fused_sigmoid_gating_delta_rule_update(
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 8)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
-    num_stages = 3
+    # num_stages=1: this is a recurrent kernel with loop-carried dependency on b_h,
+    # so multi-stage software pipelining cannot overlap loads across iterations.
+    # Using num_stages>1 only wastes registers on pipeline buffers, increasing
+    # register spilling to local memory (which causes L1TEX stalls).
+    num_stages = 1
     num_warps = 1
 
     if scale is None:
