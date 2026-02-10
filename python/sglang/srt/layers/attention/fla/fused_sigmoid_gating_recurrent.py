@@ -217,18 +217,19 @@ def fused_sigmoid_gating_delta_rule_update(
     else:
         assert scale > 0, "scale must be positive"
 
-    # Transpose b from [B, T, HV] to [HV, B, T] for time-contiguous access per head.
+    # Transpose b and a to [HV, B*T] layout for time-contiguous access per head.
     # This reduces per-timestep stride from HV to 1, improving cache line utilization
     # for scalar loads (one cache line now serves ~64 timesteps instead of ~1).
-    b = b.permute(2, 0, 1).contiguous()
+    # Inputs may be 2D [B*T, HV] or 3D [B, T, HV]; normalize to 3D via view.
+    b = b.view(B, T, HV).permute(2, 0, 1).contiguous()
 
     # Transpose a for the same benefit
     if is_kda:
-        # a: [B, T, HV*K] -> [B, T, HV, K] -> [HV, B, T, K] contiguous
+        # a: [B*T, HV*K] or [B, T, HV*K] -> [B, T, HV, K] -> [HV, B, T, K]
         a = a.view(B, T, HV, K).permute(2, 0, 1, 3).contiguous()
     else:
-        # a: [B, T, HV] -> [HV, B, T] contiguous
-        a = a.permute(2, 0, 1).contiguous()
+        # a: [B*T, HV] or [B, T, HV] -> [HV, B, T]
+        a = a.view(B, T, HV).permute(2, 0, 1).contiguous()
 
     o = q.new_empty(NK, *v.shape)
     grid = (NK, NV, N * HV)
