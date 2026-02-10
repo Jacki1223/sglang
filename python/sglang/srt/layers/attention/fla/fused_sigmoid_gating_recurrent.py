@@ -76,6 +76,16 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     mask_v = o_v < V
     mask_h = mask_k[:, None] & mask_v[None, :]
 
+    # Optimization: hoist loop-invariant loads
+    # A_log and dt_bias are constant across all timesteps
+    b_A_log = tl.load(p_A_log).to(tl.float32)
+    b_neg_exp_A = -tl.exp(b_A_log)
+    if IS_KDA:
+        b_dt_bias = tl.load(p_dt_bias, mask=mask_k, other=0).to(tl.float32)
+    else:
+        b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
+    b_inv_softplus_beta = 1.0 / softplus_beta
+
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
         idx = tl.load(h0_indices + i_n)
@@ -96,25 +106,26 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
         b_b = tl.load(p_b).to(tl.float32)
 
-        # Compute sigmoid gating
-        # Load gating parameters
-        b_A_log = tl.load(p_A_log).to(tl.float32)
-        b_a = tl.load(p_a).to(tl.float32)
-        b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
+        # Load per-timestep gating parameter (a varies per timestep)
+        if IS_KDA:
+            b_a = tl.load(p_a, mask=mask_k, other=0).to(tl.float32)
+        else:
+            b_a = tl.load(p_a).to(tl.float32)
 
         # Compute g = -exp(A_log) * softplus(a + dt_bias)
+        # b_neg_exp_A and b_dt_bias are hoisted out of loop
         x = b_a + b_dt_bias
         beta_x = softplus_beta * x
         # Apply softplus with numerical stability
         softplus_x = tl.where(
             beta_x <= softplus_threshold,
-            (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
+            b_inv_softplus_beta * tl.log(1.0 + tl.exp(beta_x)),
             x,
         )
-        b_g = -tl.exp(b_A_log) * softplus_x
+        b_g = b_neg_exp_A * softplus_x
 
         # Compute beta = sigmoid(b)
-        b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+        b_beta = tl.sigmoid(b_b)
 
         # Apply L2 normalization if enabled
         if USE_QK_L2NORM_IN_KERNEL:
@@ -148,7 +159,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         p_o += HV * V
         p_v += HV * V
         p_b += HV
-        p_a += HV
+        # Fix: IS_KDA mode has a[B, T, HV, K] layout, stride is HV * K
+        if IS_KDA:
+            p_a += HV * K
+        else:
+            p_a += HV
 
     # Store final state back to h0_source with bounds checking
     if USE_INITIAL_STATE:
@@ -194,7 +209,23 @@ def fused_sigmoid_gating_delta_rule_update(
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3
-    num_warps = 1
+
+    # Dynamic num_warps selection based on register pressure.
+    # b_h[BK, BV] float32 elements must be distributed across threads.
+    # GPU limit is ~255 registers/thread. Target <= 128 regs/thread for b_h
+    # to leave room for other variables and avoid register spill.
+    # threads = num_warps * 32
+    # regs_per_thread = BK * BV / (num_warps * 32)
+    b_h_elements = BK * BV
+    if b_h_elements <= 4096:
+        # <= 4096 elements: 2 warps → 64 regs/thread
+        num_warps = 2
+    elif b_h_elements <= 8192:
+        # <= 8192 elements: 4 warps → 64 regs/thread
+        num_warps = 4
+    else:
+        # > 8192 elements: 8 warps → e.g. 16384/256 = 64 regs/thread
+        num_warps = 8
 
     if scale is None:
         scale = k.shape[-1] ** -0.5
