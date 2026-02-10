@@ -193,7 +193,7 @@ def fused_sigmoid_gating_delta_rule_update(
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 1
-    num_warps = 4
+    num_warps = 1
 
     if scale is None:
         scale = k.shape[-1] ** -0.5

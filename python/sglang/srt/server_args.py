@@ -513,7 +513,7 @@ class ServerArgs:
 
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
-    mamba_ssm_dtype: str = "float32"
+    mamba_ssm_dtype: str = "bfloat16"
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
