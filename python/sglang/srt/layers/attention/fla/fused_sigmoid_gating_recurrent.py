@@ -96,33 +96,31 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     inv_softplus_beta = 1.0 / softplus_beta
 
     for _ in range(0, T):
-        # Load per-timestep inputs (grouped for concurrent memory issue)
+        # Issue all loads upfront for concurrent memory requests
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
         b_b = tl.load(p_b).to(tl.float32)
         b_a = tl.load(p_a).to(tl.float32)
 
-        # Compute g = -exp(A_log) * softplus(a + dt_bias)
+        # Normalize and scale q, k early (only depends on q, k loads,
+        # can execute while a, b loads are still in flight)
+        if USE_QK_L2NORM_IN_KERNEL:
+            b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
+            b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
+        b_q = b_q * scale
+
+        # Compute gating (depends on a load) and beta (depends on b load)
+        # These are independent of q/k normalization above
         x = b_a + b_dt_bias
         beta_x = softplus_beta * x
-        # Apply softplus with numerical stability
         softplus_x = tl.where(
             beta_x <= softplus_threshold,
             inv_softplus_beta * tl.log(1.0 + tl.exp(beta_x)),
             x,
         )
         b_g = b_neg_exp_A * softplus_x
-
-        # Compute beta = sigmoid(b)
         b_beta = 1.0 / (1.0 + tl.exp(-b_b))
-
-        # Apply L2 normalization if enabled
-        if USE_QK_L2NORM_IN_KERNEL:
-            b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
-            b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
-
-        b_q = b_q * scale
 
         # Apply gating to hidden state: h *= exp(g)
         if IS_KDA:
@@ -194,8 +192,8 @@ def fused_sigmoid_gating_delta_rule_update(
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
-    num_stages = 3
-    num_warps = 1
+    num_stages = 1
+    num_warps = 4
 
     if scale is None:
         scale = k.shape[-1] ** -0.5
