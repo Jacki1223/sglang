@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.fla.op import exp
 from sglang.srt.layers.attention.fla.utils import input_guard
 
 
@@ -60,16 +61,19 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     p_q = q + (bos * H + i_h) * K + o_k
     p_k = k + (bos * H + i_h) * K + o_k
     p_v = v + (bos * HV + i_hv) * V + o_v
-    p_b = b + bos * HV + i_hv
+    # b and a use transposed [HV, B*T] layout for time-contiguous access per head
+    p_b = b + i_hv * all + bos
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
     # Gating computation pointers
     p_A_log = A_log + i_hv
     if IS_KDA:
-        p_a = a + (bos * HV + i_hv) * K + o_k
+        # a transposed to [HV, B*T, K] layout
+        p_a = a + (i_hv * all + bos) * K + o_k
         p_dt_bias = dt_bias + i_hv * K + o_k
     else:
-        p_a = a + bos * HV + i_hv
+        # a transposed to [HV, B*T] layout
+        p_a = a + i_hv * all + bos
         p_dt_bias = dt_bias + i_hv
 
     mask_k = o_k < K
@@ -89,6 +93,14 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             )
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
+    # Pre-load loop-invariant gating parameters to reduce per-iteration global memory loads
+    b_neg_exp_A_log = -tl.exp(tl.load(p_A_log).to(tl.float32))
+    if IS_KDA:
+        b_dt_bias = tl.load(p_dt_bias, mask=mask_k, other=0).to(tl.float32)
+    else:
+        b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
+    b_inv_softplus_beta = 1.0 / softplus_beta
+
     for _ in range(0, T):
         # Load inputs
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
@@ -96,11 +108,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
         b_b = tl.load(p_b).to(tl.float32)
 
-        # Compute sigmoid gating
-        # Load gating parameters
-        b_A_log = tl.load(p_A_log).to(tl.float32)
-        b_a = tl.load(p_a).to(tl.float32)
-        b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
+        # Compute sigmoid gating using pre-loaded invariants
+        if IS_KDA:
+            b_a = tl.load(p_a, mask=mask_k, other=0).to(tl.float32)
+        else:
+            b_a = tl.load(p_a).to(tl.float32)
 
         # Compute g = -exp(A_log) * softplus(a + dt_bias)
         x = b_a + b_dt_bias
@@ -108,10 +120,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Apply softplus with numerical stability
         softplus_x = tl.where(
             beta_x <= softplus_threshold,
-            (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
+            b_inv_softplus_beta * tl.log(1.0 + tl.exp(beta_x)),
             x,
         )
-        b_g = -tl.exp(b_A_log) * softplus_x
+        b_g = b_neg_exp_A_log * softplus_x
 
         # Compute beta = sigmoid(b)
         b_beta = 1.0 / (1.0 + tl.exp(-b_b))
@@ -125,9 +137,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
         # Apply gating to hidden state: h *= exp(g)
         if IS_KDA:
-            b_h *= tl.exp(b_g[:, None])
+            b_h *= exp(b_g[:, None])
         else:
-            b_h *= tl.exp(b_g)
+            b_h *= exp(b_g)
 
         # Delta rule: v -= sum(h * k, dim=0)
         b_v -= tl.sum(b_h * b_k[:, None], 0)
@@ -147,8 +159,12 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         p_k += H * K
         p_o += HV * V
         p_v += HV * V
-        p_b += HV
-        p_a += HV
+        # b and a use transposed layout: stride 1 (non-KDA) or K (KDA) per timestep
+        p_b += 1
+        if IS_KDA:
+            p_a += K
+        else:
+            p_a += 1
 
     # Store final state back to h0_source with bounds checking
     if USE_INITIAL_STATE:
@@ -200,6 +216,19 @@ def fused_sigmoid_gating_delta_rule_update(
         scale = k.shape[-1] ** -0.5
     else:
         assert scale > 0, "scale must be positive"
+
+    # Transpose b from [B, T, HV] to [HV, B, T] for time-contiguous access per head.
+    # This reduces per-timestep stride from HV to 1, improving cache line utilization
+    # for scalar loads (one cache line now serves ~64 timesteps instead of ~1).
+    b = b.permute(2, 0, 1).contiguous()
+
+    # Transpose a for the same benefit
+    if is_kda:
+        # a: [B, T, HV*K] -> [B, T, HV, K] -> [HV, B, T, K] contiguous
+        a = a.view(B, T, HV, K).permute(2, 0, 1, 3).contiguous()
+    else:
+        # a: [B, T, HV] -> [HV, B, T] contiguous
+        a = a.permute(2, 0, 1).contiguous()
 
     o = q.new_empty(NK, *v.shape)
     grid = (NK, NV, N * HV)
