@@ -61,19 +61,16 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     p_q = q + (bos * H + i_h) * K + o_k
     p_k = k + (bos * H + i_h) * K + o_k
     p_v = v + (bos * HV + i_hv) * V + o_v
-    # b and a use transposed [HV, B*T] layout for time-contiguous access per head
-    p_b = b + i_hv * all + bos
+    p_b = b + bos * HV + i_hv
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
     # Gating computation pointers
     p_A_log = A_log + i_hv
     if IS_KDA:
-        # a transposed to [HV, B*T, K] layout
-        p_a = a + (i_hv * all + bos) * K + o_k
+        p_a = a + (bos * HV + i_hv) * K + o_k
         p_dt_bias = dt_bias + i_hv * K + o_k
     else:
-        # a transposed to [HV, B*T] layout
-        p_a = a + i_hv * all + bos
+        p_a = a + bos * HV + i_hv
         p_dt_bias = dt_bias + i_hv
 
     mask_k = o_k < K
@@ -93,7 +90,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             )
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
-    # Pre-load loop-invariant gating parameters to reduce per-iteration global memory loads
+    # Pre-load loop-invariant gating parameters
     b_neg_exp_A_log = -tl.exp(tl.load(p_A_log).to(tl.float32))
     if IS_KDA:
         b_dt_bias = tl.load(p_dt_bias, mask=mask_k, other=0).to(tl.float32)
@@ -117,7 +114,6 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Compute g = -exp(A_log) * softplus(a + dt_bias)
         x = b_a + b_dt_bias
         beta_x = softplus_beta * x
-        # Apply softplus with numerical stability
         softplus_x = tl.where(
             beta_x <= softplus_threshold,
             b_inv_softplus_beta * tl.log(1.0 + tl.exp(beta_x)),
@@ -159,12 +155,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         p_k += H * K
         p_o += HV * V
         p_v += HV * V
-        # b and a use transposed layout: stride 1 (non-KDA) or K (KDA) per timestep
-        p_b += 1
+        p_b += HV
         if IS_KDA:
-            p_a += K
+            p_a += HV * K
         else:
-            p_a += 1
+            p_a += HV
 
     # Store final state back to h0_source with bounds checking
     if USE_INITIAL_STATE:
@@ -206,30 +201,21 @@ def fused_sigmoid_gating_delta_rule_update(
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    # Use smaller BV (16 instead of 32) to reduce register pressure from b_h[BK, BV].
+    # This halves per-thread register usage for the accumulator (64 vs 128 regs),
+    # allowing ~2x more concurrent warps per SM to better hide memory latency.
+    # Tradeoff: NV doubles (more blocks, some redundant q/k loads), but the
+    # occupancy gain dominates since h0 state access is the bottleneck.
+    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 16)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
-    num_stages = 3
+    num_stages = 1
     num_warps = 1
 
     if scale is None:
         scale = k.shape[-1] ** -0.5
     else:
         assert scale > 0, "scale must be positive"
-
-    # Transpose b and a to [HV, B*T] layout for time-contiguous access per head.
-    # This reduces per-timestep stride from HV to 1, improving cache line utilization
-    # for scalar loads (one cache line now serves ~64 timesteps instead of ~1).
-    # Inputs may be 2D [B*T, HV] or 3D [B, T, HV]; normalize to 3D via view.
-    b = b.view(B, T, HV).permute(2, 0, 1).contiguous()
-
-    # Transpose a for the same benefit
-    if is_kda:
-        # a: [B*T, HV*K] or [B, T, HV*K] -> [B, T, HV, K] -> [HV, B, T, K]
-        a = a.view(B, T, HV, K).permute(2, 0, 1, 3).contiguous()
-    else:
-        # a: [B*T, HV] or [B, T, HV] -> [HV, B, T]
-        a = a.view(B, T, HV).permute(2, 0, 1).contiguous()
 
     o = q.new_empty(NK, *v.shape)
     grid = (NK, NV, N * HV)
