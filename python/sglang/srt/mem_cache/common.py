@@ -117,12 +117,18 @@ def write_cache_indices(
             req_to_token_pool.req_to_token.shape[1],
         )
     else:
+        # Convert CPU tensors to Python lists once, avoiding per-element
+        # Python→C++ boundary crossings inside the loop.
+        req_pool_indices_list = req_pool_indices_cpu.tolist()
+        prefix_lens_list = prefix_lens_cpu.tolist()
+        seq_lens_list = seq_lens_cpu.tolist()
+        extend_lens_list = extend_lens_cpu.tolist()
         pt = 0
-        for i in range(req_pool_indices_cpu.shape[0]):
-            req_idx = req_pool_indices_cpu[i].item()
-            prefix_len = prefix_lens_cpu[i].item()
-            seq_len = seq_lens_cpu[i].item()
-            extend_len = extend_lens_cpu[i].item()
+        for i in range(len(req_pool_indices_list)):
+            req_idx = req_pool_indices_list[i]
+            prefix_len = prefix_lens_list[i]
+            seq_len = seq_lens_list[i]
+            extend_len = extend_lens_list[i]
 
             req_to_token_pool.write(
                 (req_idx, slice(0, prefix_len)),
