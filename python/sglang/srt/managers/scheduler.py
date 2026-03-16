@@ -1463,32 +1463,19 @@ class Scheduler(
         return recv_reqs
 
     def _split_work_and_control_reqs(self, recv_reqs: List):
-        work_reqs = [
-            req
-            for req in recv_reqs
-            if isinstance(
-                req,
-                (
-                    TokenizedGenerateReqInput,
-                    TokenizedEmbeddingReqInput,
-                    BatchTokenizedGenerateReqInput,
-                    BatchTokenizedEmbeddingReqInput,
-                ),
-            )
-        ]
-        control_reqs = [
-            req
-            for req in recv_reqs
-            if not isinstance(
-                req,
-                (
-                    TokenizedGenerateReqInput,
-                    TokenizedEmbeddingReqInput,
-                    BatchTokenizedGenerateReqInput,
-                    BatchTokenizedEmbeddingReqInput,
-                ),
-            )
-        ]
+        _work_types = (
+            TokenizedGenerateReqInput,
+            TokenizedEmbeddingReqInput,
+            BatchTokenizedGenerateReqInput,
+            BatchTokenizedEmbeddingReqInput,
+        )
+        work_reqs = []
+        control_reqs = []
+        for req in recv_reqs:
+            if isinstance(req, _work_types):
+                work_reqs.append(req)
+            else:
+                control_reqs.append(req)
         return work_reqs, control_reqs
 
     def process_input_requests(self, recv_reqs: List):

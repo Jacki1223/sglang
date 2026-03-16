@@ -2122,7 +2122,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
-        self.seq_lens_sum = self.seq_lens.sum().item()
+        # seq_lens_cpu is already filtered above and lives on CPU — use it to
+        # avoid a device-to-host sync that self.seq_lens.sum().item() would trigger.
+        self.seq_lens_sum = int(self.seq_lens_cpu.sum())
 
         if self.output_ids is not None:
             self.output_ids = self.output_ids[keep_indices_device]
