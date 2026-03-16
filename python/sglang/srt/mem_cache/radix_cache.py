@@ -589,10 +589,11 @@ class RadixCache(BasePrefixCache):
         heapq.heapify(eviction_heap)
 
         num_evicted = 0
+        freed_values = []
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
-            self.token_to_kv_pool_allocator.free(x.value)
+            freed_values.append(x.value)
             num_evicted += len(x.value)
             self._delete_leaf(x)
 
@@ -601,6 +602,12 @@ class RadixCache(BasePrefixCache):
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
             self._record_remove_event(x)
+
+        # Batch all frees into a single call to minimise torch.cat / torch.unique
+        # / GPU-sync overhead.  free() is called once here instead of once per
+        # evicted node, reducing allocator overhead from O(nodes) to O(1).
+        if freed_values:
+            self.token_to_kv_pool_allocator.free(torch.cat(freed_values))
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
@@ -666,8 +673,10 @@ class RadixCache(BasePrefixCache):
         child_key = self.get_child_key_fn(key)
 
         value = []
-        while len(key) > 0 and child_key in node.children:
-            child = node.children[child_key]
+        while len(key) > 0:
+            child = node.children.get(child_key)
+            if child is None:
+                break
             child.last_access_time = access_time
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
@@ -764,8 +773,11 @@ class RadixCache(BasePrefixCache):
         total_prefix_length = 0
         matched_values: List[torch.Tensor] = []
         last_node = node
-        while len(key) > 0 and child_key in node.children:
-            node = node.children[child_key]
+        while len(key) > 0:
+            child = node.children.get(child_key)
+            if child is None:
+                break
+            node = child
             node.last_access_time = access_time
             prefix_len = self.key_match_fn(node.key, key)
             total_prefix_length += prefix_len
