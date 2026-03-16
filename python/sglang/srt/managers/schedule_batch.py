@@ -85,7 +85,7 @@ from sglang.srt.observability.req_time_stats import (
     SchedulerReqTimeStats,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.sampling_params import TOP_K_ALL, SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
@@ -2155,7 +2155,32 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
-        self.return_logprob = any(req.return_logprob for req in self.reqs)
+        # Single loop over the filtered reqs to recompute all batch-level flags.
+        # Replaces three separate any()/all() traversals and simultaneously refreshes
+        # the SamplingBatchInfo sampling flags that from_schedule_batch() sets once
+        # and that were never updated after filter_batch() runs.
+        # Pure Python, no GPU tensors involved – no synchronisation cost.
+        return_logprob = has_stream = has_grammar = False
+        is_all_greedy = True
+        need_top_p = need_top_k = need_min_p = False
+        for req in self.reqs:
+            if req.return_logprob:
+                return_logprob = True
+            if req.stream:
+                has_stream = True
+            if req.grammar:
+                has_grammar = True
+            sp = req.sampling_params
+            if sp.top_k > 1:
+                is_all_greedy = False
+            if sp.top_p != 1.0:
+                need_top_p = True
+            if sp.top_k != TOP_K_ALL:
+                need_top_k = True
+            if sp.min_p > 0:
+                need_min_p = True
+
+        self.return_logprob = return_logprob
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
             self.token_ids_logprobs = [self.token_ids_logprobs[i] for i in keep_indices]
@@ -2163,11 +2188,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = None
             self.token_ids_logprobs = None
 
-        self.has_stream = any(req.stream for req in self.reqs)
-        self.has_grammar = any(req.grammar for req in self.reqs)
+        self.has_stream = has_stream
+        self.has_grammar = has_grammar
         self._batch_cache_dirty = True
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
+        # Keep SamplingBatchInfo flags consistent with the now-filtered reqs.
+        # sampling_info.filter_batch() slices the tensors but does not update
+        # the derived boolean flags; we do it here in pure Python using the
+        # values already computed in the loop above.
+        self.sampling_info.is_all_greedy = is_all_greedy
+        self.sampling_info.need_top_p_sampling = need_top_p
+        self.sampling_info.need_top_k_sampling = need_top_k
+        self.sampling_info.need_min_p_sampling = need_min_p
         # NOTE: spec_info filtered before batch filtering only happens in:
         # - Spec v1's verify phase
         # - Only for decode batch (running_batch)
