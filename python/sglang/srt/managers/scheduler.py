@@ -2053,7 +2053,7 @@ class Scheduler(
             # Filter batch
             last_bs = self.last_batch.batch_size()
             self.last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
+                chunked_req_to_exclude=chunked_req_to_exclude
             )
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
@@ -3036,7 +3036,7 @@ class Scheduler(
                 if self.chunked_req is not None:
                     chunked_req_to_exclude.add(self.chunked_req)
             self.last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
+                chunked_req_to_exclude=chunked_req_to_exclude
             )
             self.running_batch.merge_batch(self.last_batch)
 

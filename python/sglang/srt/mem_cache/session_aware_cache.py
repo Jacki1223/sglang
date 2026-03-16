@@ -242,7 +242,7 @@ class SessionAwareCache(BasePrefixCache):
                     slot.req_pool_idx, start:end
                 ]
                 self.token_to_kv_pool_allocator.free(kv_indices)
-            self.req_to_token_pool.free_slots.append(slot.req_pool_idx)
+            self.req_to_token_pool._free_slots.append(slot.req_pool_idx)
 
     def session_held_tokens(self) -> int:
         """Total KV tokens held by session slots, not tracked by the tree."""

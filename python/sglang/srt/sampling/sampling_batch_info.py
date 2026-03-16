@@ -73,20 +73,24 @@ class SamplingBatchInfo:
 
         reqs = batch.reqs
         device = batch.device
-        temperatures = torch.tensor(
-            [r.sampling_params.temperature for r in reqs],
-            dtype=torch.float,
-            device=device,
-        ).view(-1, 1)
-        top_ps = torch.tensor(
-            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
-        )
-        top_ks = torch.tensor(
-            [r.sampling_params.top_k for r in reqs], dtype=torch.int32, device=device
-        )
-        min_ps = torch.tensor(
-            [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
-        )
+        bs = len(reqs)
+
+        # Build all sampling params in a single CPU pass, then transfer to GPU
+        # once. This replaces 4 separate list-comprehension + torch.tensor +
+        # CPU→GPU transfers with 1 combined transfer.
+        sampling_buf = torch.empty(bs, 4, dtype=torch.float)
+        sampling_buf_ptr = sampling_buf.data_ptr()  # noqa: F841 — keeps ref alive
+        for i, r in enumerate(reqs):
+            sp = r.sampling_params
+            sampling_buf[i, 0] = sp.temperature
+            sampling_buf[i, 1] = sp.top_p
+            sampling_buf[i, 2] = float(sp.top_k)
+            sampling_buf[i, 3] = sp.min_p
+        sampling_buf_device = sampling_buf.to(device, non_blocking=True)
+        temperatures = sampling_buf_device[:, 0].view(-1, 1)
+        top_ps = sampling_buf_device[:, 1]
+        min_ps = sampling_buf_device[:, 3]
+        top_ks = sampling_buf_device[:, 2].to(torch.int32)
         sampling_seed = (
             torch.tensor(
                 [

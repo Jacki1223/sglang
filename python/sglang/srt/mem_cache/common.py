@@ -449,11 +449,14 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             token_per_req=token_per_req,
         )
 
-    # Write to req_to_token_pool
+    # Write to req_to_token_pool.
+    # No clone needed: the indexed assignment in write() is submitted to the
+    # same CUDA stream before any subsequent in-place mutation of seq_lens
+    # (e.g. add_(1) in prepare_for_decode), so ordering is guaranteed.
     if batch.model_config.is_encoder_decoder:
         locs = batch.encoder_lens + batch.seq_lens
     else:
-        locs = batch.seq_lens.clone()
+        locs = batch.seq_lens
 
     batch.req_to_token_pool.write(
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)

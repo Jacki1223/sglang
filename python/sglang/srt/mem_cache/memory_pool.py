@@ -144,13 +144,27 @@ class ReqToTokenPool:
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )
-        self.free_slots = list(range(size))
+        # Use a flat list + cursor to avoid list slicing overhead in alloc().
+        # Slots before _alloc_cursor are already allocated; slots from
+        # _alloc_cursor onward are free. free() appends to the tail.
+        self._free_slots = list(range(size))
+        self._alloc_cursor = 0
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
 
+    @property
+    def free_slots(self):
+        """Backward-compatible view of free slots (used by external callers)."""
+        return self._free_slots[self._alloc_cursor :]
+
+    @free_slots.setter
+    def free_slots(self, value):
+        self._free_slots = list(value)
+        self._alloc_cursor = 0
+
     def available_size(self):
-        return len(self.free_slots)
+        return len(self._free_slots) - self._alloc_cursor
 
     def alloc(self, reqs: list[Req]) -> Optional[List[int]]:
         # Indices of reqs that already have a req_pool_idx and will reuse
@@ -165,10 +179,12 @@ class ReqToTokenPool:
         ), "reusing request must be chunked or have committed KV"
 
         need_size = len(reqs) - len(reusing)
-        if need_size > len(self.free_slots):
+        if need_size > self.available_size():
             return None
-        select_index = self.free_slots[:need_size]
-        self.free_slots = self.free_slots[need_size:]
+        # Advance cursor instead of slicing — O(1) instead of O(n).
+        start = self._alloc_cursor
+        self._alloc_cursor += need_size
+        select_index = self._free_slots[start : self._alloc_cursor]
         offset = 0
         for r in reqs:
             if r.req_pool_idx is None:
@@ -178,11 +194,18 @@ class ReqToTokenPool:
 
     def free(self, req: Req):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
-        self.free_slots.append(req.req_pool_idx)
+        self._free_slots.append(req.req_pool_idx)
         req.req_pool_idx = None
 
     def clear(self):
-        self.free_slots = list(range(self.size))
+        self._free_slots = list(range(self.size))
+        self._alloc_cursor = 0
+
+    def _compact_free_slots(self):
+        """Reclaim memory from consumed slots when cursor grows too large."""
+        if self._alloc_cursor > 0:
+            self._free_slots = self._free_slots[self._alloc_cursor :]
+            self._alloc_cursor = 0
 
 
 class MambaPool:

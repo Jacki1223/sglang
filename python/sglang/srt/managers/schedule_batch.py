@@ -2074,7 +2074,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def filter_batch(
         self,
-        chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
+        chunked_req_to_exclude: Optional[Union[Req, List[Req], Set[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
         # FIXME(lsyin): deprecate this API after spec v1 is deprecated
         v1_spec_info_filtered: Optional[bool] = False,
@@ -2085,14 +2085,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
-                chunked_req_to_exclude = [chunked_req_to_exclude]
+                exclude_set = {chunked_req_to_exclude}
             elif chunked_req_to_exclude is None:
-                chunked_req_to_exclude = []
+                exclude_set = set()
+            else:
+                # Convert to set for O(1) membership test instead of O(n) list scan.
+                exclude_set = set(chunked_req_to_exclude)
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
-                and self.reqs[i] not in chunked_req_to_exclude
+                and self.reqs[i] not in exclude_set
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
@@ -2122,7 +2125,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
-        self.seq_lens_sum = self.seq_lens.sum().item()
+        # Use CPU tensor to avoid implicit GPU→CPU synchronization from .item().
+        self.seq_lens_sum = self.seq_lens_cpu.sum().item()
 
         if self.output_ids is not None:
             self.output_ids = self.output_ids[keep_indices_device]
