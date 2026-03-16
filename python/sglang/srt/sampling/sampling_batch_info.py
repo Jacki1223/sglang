@@ -267,6 +267,17 @@ class SamplingBatchInfo:
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
 
+        # Refresh sampling flags from the now-filtered tensors.
+        # The flags (is_all_greedy, need_top_p_sampling, …) are computed once
+        # in from_schedule_batch() and then reused across all decode steps.
+        # Without this refresh, they become stale after requests finish:
+        # e.g. the last non-greedy request completes but is_all_greedy stays
+        # False, forcing every subsequent step through the slower sampling path.
+        self.is_all_greedy = bool(self.top_ks.le(1).all().item())
+        self.need_top_p_sampling = bool(self.top_ps.ne(1.0).any().item())
+        self.need_top_k_sampling = bool(self.top_ks.ne(TOP_K_ALL).any().item())
+        self.need_min_p_sampling = bool(self.min_ps.gt(0.0).any().item())
+
     def _filter_batch_custom_logit_processor(
         self, keep_indices: List[int], keep_indices_device: torch.Tensor
     ):
