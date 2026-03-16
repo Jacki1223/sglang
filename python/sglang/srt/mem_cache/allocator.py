@@ -26,7 +26,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
+from sglang.srt.utils import get_bool_env_var, get_num_new_pages
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -238,32 +238,22 @@ def alloc_extend_kernel(
     last_loc_ptr,
     free_page_ptr,
     out_indices,
-    bs_upper: tl.constexpr,
+    extend_lens_cumsum_ptr,    # precomputed exclusive prefix sum of extend_lens
+    num_new_pages_cumsum_ptr,  # precomputed exclusive prefix sum of num_new_pages
     page_size: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
-    load_offset = tl.arange(0, bs_upper)
-    seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid)
-    pre_lens = tl.load(pre_lens_ptr + load_offset, mask=load_offset <= pid)
-    extend_lens = seq_lens - pre_lens
-
     seq_len = tl.load(seq_lens_ptr + pid)
     pre_len = tl.load(pre_lens_ptr + pid)
-    extend_len = seq_len - pre_len
 
-    sum_extend_lens = tl.sum(extend_lens)
-    output_start_loc = sum_extend_lens - extend_len
-
-    num_pages_after = (seq_lens + page_size - 1) // page_size
-    num_pages_before = (pre_lens + page_size - 1) // page_size
-    num_new_pages = num_pages_after - num_pages_before
+    # O(1) lookups into precomputed exclusive prefix sums (was O(B) load+sum each)
+    output_start_loc = tl.load(extend_lens_cumsum_ptr + pid)
 
     num_page_start_loc_self = (seq_len + page_size - 1) // page_size - (
         pre_len + page_size - 1
     ) // page_size
-    sum_num_new_pages = tl.sum(num_new_pages)
-    new_page_start_loc = sum_num_new_pages - num_page_start_loc_self
+    new_page_start_loc = tl.load(num_new_pages_cumsum_ptr + pid)
 
     # Part 1: fill the old partial page
     last_loc = tl.load(last_loc_ptr + pid)
@@ -323,27 +313,19 @@ def alloc_decode_kernel(
     last_loc_ptr,
     free_page_ptr,
     out_indices,
-    bs_upper: tl.constexpr,
+    num_new_pages_cumsum_ptr,  # precomputed exclusive prefix sum of num_new_pages
     page_size: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
-    load_offset = tl.arange(0, bs_upper)
-    seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid)
-    pre_lens = tl.where(load_offset <= pid, seq_lens - 1, seq_lens)
-
     seq_len = tl.load(seq_lens_ptr + pid)
     pre_len = seq_len - 1
-
-    num_pages_after = (seq_lens + page_size - 1) // page_size
-    num_pages_before = (pre_lens + page_size - 1) // page_size
-    num_new_pages = num_pages_after - num_pages_before
 
     num_page_start_loc_self = (seq_len + page_size - 1) // page_size - (
         pre_len + page_size - 1
     ) // page_size
-    sum_num_new_pages = tl.sum(num_new_pages)
-    new_page_start_loc = sum_num_new_pages - num_page_start_loc_self
+    # O(1) lookup into precomputed exclusive prefix sum (was O(B) load+sum)
+    new_page_start_loc = tl.load(num_new_pages_cumsum_ptr + pid)
 
     if num_page_start_loc_self == 0:
         last_loc = tl.load(last_loc_ptr + pid)
@@ -420,6 +402,23 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         ):
             self.merge_and_sort_free()
 
+        # Precompute exclusive prefix sums on CPU — O(B) instead of O(B²) in-kernel
+        extend_lens_cpu = (seq_lens_cpu - prefix_lens_cpu).to(torch.int64)
+        extend_lens_cumsum_cpu = torch.zeros(bs, dtype=torch.int64)
+        if bs > 1:
+            extend_lens_cumsum_cpu[1:] = extend_lens_cpu[:-1].cumsum(0)
+
+        num_new_pages_per_req_cpu = (
+            (seq_lens_cpu + self.page_size - 1) // self.page_size
+            - (prefix_lens_cpu + self.page_size - 1) // self.page_size
+        ).to(torch.int64)
+        num_new_pages_cumsum_cpu = torch.zeros(bs, dtype=torch.int64)
+        if bs > 1:
+            num_new_pages_cumsum_cpu[1:] = num_new_pages_per_req_cpu[:-1].cumsum(0)
+
+        extend_lens_cumsum = extend_lens_cumsum_cpu.to(self.device)
+        num_new_pages_cumsum = num_new_pages_cumsum_cpu.to(self.device)
+
         out_indices = torch.empty(
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
@@ -430,7 +429,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             last_loc,
             self.free_pages,
             out_indices,
-            next_power_of_2(bs),
+            extend_lens_cumsum,
+            num_new_pages_cumsum,
             self.page_size,
         )
 
@@ -463,13 +463,24 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.need_sort and bs > len(self.free_pages):
             self.merge_and_sort_free()
 
+        # Precompute exclusive prefix sum of num_new_pages on CPU — O(B) instead of O(B²)
+        # For decode: pre_len = seq_len - 1, so num_new_pages[i] = 1 iff seq_len is page-aligned
+        num_new_pages_per_req_cpu = (
+            (seq_lens_cpu + self.page_size - 1) // self.page_size
+            - (seq_lens_cpu - 1 + self.page_size - 1) // self.page_size
+        ).to(torch.int64)
+        num_new_pages_cumsum_cpu = torch.zeros(bs, dtype=torch.int64)
+        if bs > 1:
+            num_new_pages_cumsum_cpu[1:] = num_new_pages_per_req_cpu[:-1].cumsum(0)
+        num_new_pages_cumsum = num_new_pages_cumsum_cpu.to(self.device)
+
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
         alloc_decode_kernel[(bs,)](
             seq_lens,
             last_loc,
             self.free_pages,
             out_indices,
-            next_power_of_2(bs),
+            num_new_pages_cumsum,
             self.page_size,
         )
 
