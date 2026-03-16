@@ -1100,11 +1100,17 @@ def compute_position_triton(
     positions = torch.empty(
         extend_seq_lens_sum, dtype=torch.int64, device=extend_seq_lens.device
     )
+    # Pre-compute cumulative start locations on GPU with O(N) torch.cumsum,
+    # replacing the O(N^2) per-thread sequential loop in the Triton kernel.
     extend_start_loc = torch.empty(
-        batch_size, dtype=torch.int32, device=extend_seq_lens.device
+        batch_size, dtype=torch.int64, device=extend_seq_lens.device
     )
+    if batch_size > 0:
+        extend_start_loc[0] = 0
+        if batch_size > 1:
+            torch.cumsum(extend_seq_lens[:-1], dim=0, out=extend_start_loc[1:])
 
-    # Launch kernel
+    # Launch kernel — each thread now reads its start_loc directly
     compute_position_kernel[(batch_size,)](
         positions,
         extend_start_loc,
@@ -1113,7 +1119,7 @@ def compute_position_triton(
         has_prefix,
     )
 
-    return positions, extend_start_loc
+    return positions, extend_start_loc.to(torch.int32)
 
 
 @triton.jit
@@ -1130,10 +1136,10 @@ def compute_position_kernel(
     prefix_len = tl.load(extend_prefix_lens + pid) if has_prefix else 0
     seq_len = tl.load(extend_seq_lens + pid)
 
-    # NOTE: This can be slow for large bs
-    cumsum_start = tl.cast(0, tl.int64)
-    for i in range(pid):
-        cumsum_start += tl.load(extend_seq_lens + i)
+    # Read pre-computed cumulative start location (O(1) per thread).
+    # Previously this was an O(N) sequential loop per thread, causing
+    # O(N^2) total global memory reads across all threads.
+    cumsum_start = tl.load(extend_start_loc + pid)
 
     num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
     for i in range(num_loop):
@@ -1143,7 +1149,6 @@ def compute_position_kernel(
             prefix_len + offset,
             mask=offset < seq_len,
         )
-    tl.store(extend_start_loc + pid, cumsum_start)
 
 
 def compute_position_torch(
