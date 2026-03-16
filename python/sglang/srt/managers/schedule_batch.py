@@ -1326,6 +1326,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     dp_cooperation_info: Optional[DPCooperationInfo] = None
     prefill_stats: Optional[PrefillStats] = None
 
+    # Cache for per-forward-pass list comprehensions.
+    # Marked dirty whenever batch composition changes (filter_batch / merge_batch).
+    # Rebuilt lazily in get_model_worker_batch() to avoid O(n) work every decode step.
+    _batch_cache_dirty: bool = dataclasses.field(default=True, compare=False, repr=False)
+    _lora_ids_cache: Optional[List] = dataclasses.field(
+        default=None, compare=False, repr=False
+    )
+    _grammars_cache: Optional[List] = dataclasses.field(
+        default=None, compare=False, repr=False
+    )
+
     @classmethod
     def init_new(
         cls,
@@ -1339,11 +1350,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         chunked_req: Optional[Req] = None,
         dllm_config: Optional[DllmConfig] = None,
     ):
-        return_logprob = any(req.return_logprob for req in reqs)
+        return_logprob = has_stream = has_grammar = return_hidden_states = return_routed_experts = (
+            False
+        )
+        is_prefill_only = True
+        for req in reqs:
+            if req.return_logprob:
+                return_logprob = True
+            if req.stream:
+                has_stream = True
+            if req.grammar:
+                has_grammar = True
+            if req.return_hidden_states:
+                return_hidden_states = True
+            if req.return_routed_experts:
+                return_routed_experts = True
+            if not req.is_prefill_only:
+                is_prefill_only = False
 
-        is_hybrid_swa = False
-        if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-            is_hybrid_swa = True
+        is_hybrid_swa = isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
 
         return cls(
             reqs=reqs,
@@ -1354,13 +1379,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             model_config=model_config,
             enable_overlap=enable_overlap,
             return_logprob=return_logprob,
-            has_stream=any(req.stream for req in reqs),
-            has_grammar=any(req.grammar for req in reqs),
+            has_stream=has_stream,
+            has_grammar=has_grammar,
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
-            return_hidden_states=any(req.return_hidden_states for req in reqs),
-            return_routed_experts=any(req.return_routed_experts for req in reqs),
-            is_prefill_only=all(req.is_prefill_only for req in reqs),
+            return_hidden_states=return_hidden_states,
+            return_routed_experts=return_routed_experts,
+            is_prefill_only=is_prefill_only,
             chunked_req=chunked_req,
             dllm_config=dllm_config,
         )
@@ -2140,6 +2165,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.has_stream = any(req.stream for req in self.reqs)
         self.has_grammar = any(req.grammar for req in self.reqs)
+        self._batch_cache_dirty = True
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
         # NOTE: spec_info filtered before batch filtering only happens in:
@@ -2202,6 +2228,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.has_stream |= other.has_stream
         self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
+        self._batch_cache_dirty = True
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
@@ -2216,11 +2243,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_prefix_lens = self.prefix_lens
             extend_logprob_start_lens = self.extend_logprob_start_lens
 
+        # Rebuild per-request lists only when batch composition changed.
+        if self._batch_cache_dirty:
+            self._lora_ids_cache = [req.lora_id for req in self.reqs]
+            self._grammars_cache = (
+                [req.grammar for req in self.reqs] if self.has_grammar else None
+            )
+            self._batch_cache_dirty = False
+
         if self.sampling_info:
-            if self.has_grammar:
-                self.sampling_info.grammars = [req.grammar for req in self.reqs]
-            else:
-                self.sampling_info.grammars = None
+            self.sampling_info.grammars = self._grammars_cache
 
         seq_lens_cpu = (
             seq_lens_cpu_cache if seq_lens_cpu_cache is not None else self.seq_lens_cpu
@@ -2254,7 +2286,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             encoder_lens=self.encoder_lens,
             encoder_lens_cpu=self.encoder_lens_cpu,
             encoder_out_cache_loc=self.encoder_out_cache_loc,
-            lora_ids=[req.lora_id for req in self.reqs],
+            lora_ids=self._lora_ids_cache,
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
             ne_token_table=self.ne_token_table,
