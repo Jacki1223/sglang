@@ -31,7 +31,7 @@ def write_req_to_token_pool_triton(
     prefix_tensors,
     pre_lens,
     seq_lens,
-    extend_lens,
+    cumsum_extend_lens,  # exclusive prefix sum of extend_lens, shape [bs]
     out_cache_loc,
     req_to_token_ptr_stride: tl.constexpr,
 ):
@@ -55,10 +55,10 @@ def write_req_to_token_pool_triton(
             mask=mask,
         )
 
-    # NOTE: This can be slow for large bs
-    cumsum_start = tl.cast(0, tl.int64)
-    for i in range(pid):
-        cumsum_start += tl.load(extend_lens + i)
+    # The exclusive prefix sum is precomputed on the CPU side so that each
+    # kernel program only needs a single O(1) load rather than an O(pid)
+    # sequential scan, eliminating the O(B^2) work across the whole batch.
+    cumsum_start = tl.load(cumsum_extend_lens + pid)
 
     num_loop = tl.cdiv(seq_len - pre_len, BLOCK_SIZE)
     for i in range(num_loop):
@@ -94,14 +94,25 @@ def write_cache_indices(
             device=req_to_token_pool.device,
             dtype=torch.uint64,
         )
-        # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
-        write_req_to_token_pool_triton[(req_pool_indices_tensor.shape[0],)](
+        # Compute the exclusive prefix sum of extend_lens on the CPU so each
+        # kernel program can find its output slice with a single O(1) load
+        # instead of an O(pid) sequential scan inside the kernel.
+        # e.g. extend_lens = [3, 5, 2]  →  cumsum_extend_lens = [0, 3, 8]
+        bs = extend_lens_cpu.shape[0]
+        cumsum_extend_lens_cpu = torch.empty(bs, dtype=torch.int64)
+        cumsum_extend_lens_cpu[0] = 0
+        if bs > 1:
+            torch.cumsum(extend_lens_cpu[:-1], 0, out=cumsum_extend_lens_cpu[1:])
+        cumsum_extend_lens = cumsum_extend_lens_cpu.to(
+            req_to_token_pool.device, non_blocking=True
+        )
+        write_req_to_token_pool_triton[(bs,)](
             req_to_token_pool.req_to_token,
             req_pool_indices_tensor,
             prefix_pointers,
             prefix_lens_tensor,
             seq_lens_tensor,
-            extend_lens_tensor,
+            cumsum_extend_lens,
             out_cache_loc,
             req_to_token_pool.req_to_token.shape[1],
         )
