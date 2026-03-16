@@ -129,8 +129,9 @@ class TreeNode:
             0.0  # absolute expiry time (time.monotonic()), 0 = not pinned
         )
         self.pin_ttl: int = 0  # original TTL in seconds, for refresh-on-hit
-        self.last_access_time = time.monotonic()
-        self.creation_time = time.monotonic()
+        _now = time.monotonic()
+        self.last_access_time = _now
+        self.creation_time = _now
 
         self.hit_count = 0
         # indicating the node is locked to protect from eviction
@@ -524,8 +525,10 @@ class RadixCache(BasePrefixCache):
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
 
-        # Radix Cache takes one ref in memory pool
-        result = self.insert(
+        # Radix Cache takes one ref in memory pool.
+        # insert_collect merges the insert + match_prefix into a single tree
+        # traversal, avoiding a redundant second pass over the same path.
+        new_prefix_len, new_indices, new_last_node = self.insert_collect(
             InsertParams(
                 key=radix_key,
                 value=values,
@@ -533,18 +536,11 @@ class RadixCache(BasePrefixCache):
                 priority=getattr(req, "priority", 0) or 0,
             )
         )
-        new_prefix_len = result.prefix_len
 
         self.token_to_kv_pool_allocator.free(
             kv_indices[req.cache_protected_len : new_prefix_len]
         )
 
-        # The prefix indices could be updated, reuse it
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
-        new_indices, new_last_node = (
-            match_result.device_indices,
-            match_result.last_device_node,
-        )
         assert len(new_indices) == len(keys), f"{len(new_indices)=}, {len(keys)=}"
 
         self.req_to_token_pool.write(
@@ -670,7 +666,7 @@ class RadixCache(BasePrefixCache):
         child_key = self.get_child_key_fn(key)
 
         value = []
-        while len(key) > 0 and child_key in node.children.keys():
+        while len(key) > 0 and child_key in node.children:
             child = node.children[child_key]
             child.last_access_time = access_time
             prefix_len = self.key_match_fn(child.key, key)
@@ -727,6 +723,32 @@ class RadixCache(BasePrefixCache):
         priority: int = 0,
         chunked: bool = False,
     ):
+        prefix_len, _, _ = self._insert_helper_collecting(
+            node, key, value, priority, chunked
+        )
+        return prefix_len
+
+    def _insert_helper_collecting(
+        self,
+        node: TreeNode,
+        key: RadixKey,
+        value,
+        priority: int = 0,
+        chunked: bool = False,
+    ) -> Tuple[int, List[torch.Tensor], "TreeNode"]:
+        """Insert a key-value pair into the radix tree.
+
+        Unlike ``_insert_helper``, this method also collects the full list of
+        matched value tensors and the terminal node so that callers can avoid a
+        subsequent ``match_prefix`` call on the same key.
+
+        Returns:
+            Tuple of (existing_prefix_len, matched_values, last_node) where:
+              - existing_prefix_len: number of tokens already cached before this insert
+              - matched_values: list of value tensors for ALL inserted/matched tokens
+                (can be torch.cat'd to get the full device_indices)
+              - last_node: terminal TreeNode of the matched/inserted path
+        """
         # Convert None priority to 0
         if priority is None:
             priority = 0
@@ -735,12 +757,14 @@ class RadixCache(BasePrefixCache):
         # Update priority along the path (take max to propagate higher priority)
         node.priority = max(node.priority, priority)
         if len(key) == 0:
-            return 0
+            return 0, [], node
 
         child_key = self.get_child_key_fn(key)
 
         total_prefix_length = 0
-        while len(key) > 0 and child_key in node.children.keys():
+        matched_values: List[torch.Tensor] = []
+        last_node = node
+        while len(key) > 0 and child_key in node.children:
             node = node.children[child_key]
             node.last_access_time = access_time
             prefix_len = self.key_match_fn(node.key, key)
@@ -753,9 +777,13 @@ class RadixCache(BasePrefixCache):
                 new_node.priority = max(new_node.priority, priority)
                 self._inc_hit_count(new_node, chunked)
                 node = new_node
+                matched_values.append(new_node.value)
+                last_node = new_node
             else:
                 node.priority = max(node.priority, priority)
                 self._inc_hit_count(node, chunked)
+                matched_values.append(node.value)
+                last_node = node
             if len(key):
                 child_key = self.get_child_key_fn(key)
 
@@ -771,7 +799,44 @@ class RadixCache(BasePrefixCache):
             self._update_leaf_status(new_node)
             # Hash will be computed lazily during event emission
             self._record_store_event(new_node)
-        return total_prefix_length
+            matched_values.append(new_node.value)
+            last_node = new_node
+        return total_prefix_length, matched_values, last_node
+
+    def insert_collect(
+        self, params: InsertParams
+    ) -> Tuple[int, torch.Tensor, "TreeNode"]:
+        """Insert and return full matched indices in a single tree traversal.
+
+        Functionally equivalent to calling ``insert`` followed by
+        ``match_prefix`` on the same key, but avoids the redundant second
+        traversal by collecting results during the insert pass.
+
+        Returns:
+            Tuple of (existing_prefix_len, device_indices, last_node).
+        """
+        if self.disable:
+            return 0, torch.empty((0,), dtype=torch.int64, device=self.device), self.root_node
+
+        key = params.key
+        value = params.value
+        priority = params.priority
+        chunked = params.chunked
+
+        if value is None:
+            value = torch.tensor(key.token_ids, dtype=torch.int64)
+
+        key, value = self.maybe_bigram_convert(key, value)
+
+        prefix_len, matched_values, last_node = self._insert_helper_collecting(
+            self.root_node, key, value, priority, chunked
+        )
+        device_indices = (
+            torch.cat(matched_values)
+            if matched_values
+            else torch.empty((0,), dtype=torch.int64, device=self.device)
+        )
+        return prefix_len, device_indices, last_node
 
     def _print_helper(self, node: TreeNode, indent: int):
         """Prints the radix tree in a human-readable format."""
@@ -802,18 +867,21 @@ class RadixCache(BasePrefixCache):
         self._update_leaf_status(node.parent)
 
     def _update_leaf_status(self, node: TreeNode):
+        # Compute membership once; set.__contains__ hashes the object each call.
+        is_in_leaves = node in self.evictable_leaves
+
         if node.evicted or node.lock_ref > 0:
-            if node in self.evictable_leaves:
+            if is_in_leaves:
                 self.evictable_leaves.remove(node)
             return
 
         for child in node.children.values():
             if not child.evicted:
-                if node in self.evictable_leaves:
+                if is_in_leaves:
                     self.evictable_leaves.remove(node)
                 return
 
-        if node not in self.evictable_leaves:
+        if not is_in_leaves:
             self.evictable_leaves.add(node)
 
     def _total_size_helper(self):
