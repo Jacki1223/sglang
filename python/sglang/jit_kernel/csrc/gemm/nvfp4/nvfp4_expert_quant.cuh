@@ -8,6 +8,7 @@
 #include "nvfp4_quant.cuh"
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
+#include <unordered_map>
 
 using namespace host;
 
@@ -439,11 +440,18 @@ void quant_impl(
     int k,
     int n_experts,
     cudaStream_t stream) {
-  // TODO: this multiProcessorCount should be cached.
+  // Cache multiProcessorCount per device to avoid repeated cudaDeviceGetAttribute calls
   int device;
   cudaGetDevice(&device);
+  static thread_local std::unordered_map<int, int> sm_count_cache;
   int multiProcessorCount;
-  cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device);
+  auto it = sm_count_cache.find(device);
+  if (it != sm_count_cache.end()) {
+    multiProcessorCount = it->second;
+  } else {
+    cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device);
+    sm_count_cache[device] = multiProcessorCount;
+  }
 
   // Grid, Block size.
   // Each thread converts 8 values.
