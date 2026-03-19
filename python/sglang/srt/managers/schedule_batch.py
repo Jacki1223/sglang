@@ -2091,9 +2091,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
-                chunked_req_to_exclude = [chunked_req_to_exclude]
+                chunked_req_to_exclude = {chunked_req_to_exclude}
             elif chunked_req_to_exclude is None:
-                chunked_req_to_exclude = []
+                chunked_req_to_exclude = set()
+            else:
+                chunked_req_to_exclude = set(chunked_req_to_exclude)
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
@@ -2136,16 +2138,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
-        self.return_logprob = any(req.return_logprob for req in self.reqs)
+        # Single pass over requests instead of three separate any() calls
+        has_logprob = False
+        has_stream = False
+        has_grammar = False
+        for req in self.reqs:
+            has_logprob = has_logprob or req.return_logprob
+            has_stream = has_stream or req.stream
+            has_grammar = has_grammar or bool(req.grammar)
+            if has_logprob and has_stream and has_grammar:
+                break
+        self.return_logprob = has_logprob
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
             self.token_ids_logprobs = [self.token_ids_logprobs[i] for i in keep_indices]
         else:
             self.top_logprobs_nums = None
             self.token_ids_logprobs = None
-
-        self.has_stream = any(req.stream for req in self.reqs)
-        self.has_grammar = any(req.grammar for req in self.reqs)
+        self.has_stream = has_stream
+        self.has_grammar = has_grammar
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
         # NOTE: spec_info filtered before batch filtering only happens in:

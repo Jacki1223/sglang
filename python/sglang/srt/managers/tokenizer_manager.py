@@ -1870,18 +1870,53 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         token_logprobs_idx: List[int],
         decode_to_text: bool,
     ):
-        # TODO: The current implementation only batches the detokenization for top-k tokens per single position.
-        # We should batch all top-k tokens in all positions.
-        ret = []
+        if not decode_to_text or self.tokenizer is None:
+            # Fast path: no text decoding needed
+            ret = []
+            for i in range(len(token_logprobs_val)):
+                if token_logprobs_val[i]:
+                    ret.append(
+                        list(
+                            zip(
+                                token_logprobs_val[i],
+                                token_logprobs_idx[i],
+                                [None] * len(token_logprobs_val[i]),
+                            )
+                        )
+                    )
+                else:
+                    ret.append(None)
+            return ret
+
+        # Batch all top-k tokens across all positions into a single batch_decode call
+        all_token_ids = []
+        position_map = []  # (position_index, local_offset, count)
         for i in range(len(token_logprobs_val)):
             if token_logprobs_val[i]:
-                ret.append(
-                    self.detokenize_logprob_tokens(
-                        token_logprobs_val[i], token_logprobs_idx[i], decode_to_text
+                start = len(all_token_ids)
+                count = len(token_logprobs_idx[i])
+                all_token_ids.extend([idx] for idx in token_logprobs_idx[i])
+                position_map.append((i, start, count))
+            else:
+                position_map.append((i, -1, 0))
+
+        # Single batched decode call for all tokens
+        all_texts = (
+            self.tokenizer.batch_decode(all_token_ids) if all_token_ids else []
+        )
+
+        # Reconstruct per-position results
+        ret = [None] * len(token_logprobs_val)
+        for pos_idx, start, count in position_map:
+            if count > 0:
+                texts = all_texts[start : start + count]
+                ret[pos_idx] = list(
+                    zip(
+                        token_logprobs_val[pos_idx],
+                        token_logprobs_idx[pos_idx],
+                        texts,
                     )
                 )
-            else:
-                ret.append(None)
         return ret
 
     def _calculate_spec_decoding_metrics(

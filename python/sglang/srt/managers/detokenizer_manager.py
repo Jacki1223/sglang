@@ -320,7 +320,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if recv_obj.finished_reasons[i] is None:
                 # Streaming chunk: update the decode status
                 if len(new_text) > 0 and not new_text.endswith("�"):
-                    s.decoded_text = s.decoded_text + new_text
+                    s.decoded_text += new_text
                     s.surr_offset = s.read_offset
                     s.read_offset = len(s.decode_ids)
                     new_text = ""
