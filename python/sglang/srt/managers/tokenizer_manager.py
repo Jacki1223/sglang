@@ -1532,8 +1532,18 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
-                logger.error(
-                    f"Received output for {rid=} but the state was deleted in TokenizerManager."
+                # This is an expected race condition: AbortReq (SERVICE_UNAVAILABLE or
+                # INTERNAL_SERVER_ERROR) takes a direct fast path from the Scheduler to
+                # TokenizerManager (bypassing the Detokenizer), while BatchStrOutput takes
+                # the slow path via the Detokenizer. The fast-path AbortReq can arrive and
+                # trigger state deletion before the in-flight slow-path BatchStrOutput
+                # messages are processed, causing these stale outputs to be silently dropped.
+                # Triggers: _abort_on_queued_limit (retracted req re-entering a full queue)
+                # or reqs_to_abort in update_running_batch (extreme OOM).
+                logger.warning(
+                    f"Received output for {rid=} but the state was already deleted in "
+                    "TokenizerManager. This is expected when a request is force-aborted "
+                    "while outputs are still in-flight via the detokenizer pipeline."
                 )
                 continue
 
@@ -2159,7 +2169,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
             return
-        state = self.rid_to_state[recv_obj.rid]
+        state = self.rid_to_state.get(recv_obj.rid)
+        if state is None:
+            # The state may have already been cleaned up (e.g., request finished normally
+            # before this AbortReq arrived, or a previous AbortReq already processed it).
+            logger.warning(
+                f"Abort req for {recv_obj.rid=} but state not found, already cleaned up."
+            )
+            return
         state.finished = True
         state.time_stats.set_finished_time()
 
