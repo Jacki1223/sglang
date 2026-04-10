@@ -186,6 +186,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 )
 from sglang.srt.managers.session_controller import SessionController
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
+from sglang.srt.mem_cache.admission_policy import create_admission_policy
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -777,6 +778,18 @@ class Scheduler(
         if self.model_config.is_multimodal and uses_transformers_backend:
             effective_chunked_prefill_size = None
 
+        # Build the KV cache admission policy from server args.
+        _admission_policy = create_admission_policy(
+            policy=server_args.kv_cache_admission_policy,
+            min_hit_count=server_args.kv_cache_admission_min_hit_count,
+            always_admit_pages=server_args.kv_cache_admission_always_admit_pages,
+            min_frequency=server_args.kv_cache_admission_min_frequency,
+            ngram_window_size=server_args.kv_cache_admission_ngram_window_size,
+            min_count=server_args.kv_cache_admission_min_count,
+            hash_window_size=server_args.kv_cache_admission_hash_window_size,
+            always_admit_prefix_len=server_args.kv_cache_admission_always_prefix_len,
+        )
+
         params = CacheInitParams(
             disable=self.disable_radix_cache,
             req_to_token_pool=self.req_to_token_pool,
@@ -796,6 +809,7 @@ class Scheduler(
             pp_size=self.pp_size,
             chunked_prefill_size=effective_chunked_prefill_size,
             sliding_window_size=self.sliding_window_size,
+            admission_policy=_admission_policy,
         )
 
         if effective_chunked_prefill_size is not None and self.disable_radix_cache:

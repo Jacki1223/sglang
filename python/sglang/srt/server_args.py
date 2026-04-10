@@ -179,6 +179,15 @@ NSA_CHOICES = [
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
 
+# KV cache admission policy choices (see sglang.srt.mem_cache.admission_policy).
+KV_CACHE_ADMISSION_POLICY_CHOICES = [
+    "always",
+    "never",
+    "prefix_popularity",
+    "ngram_frequency",
+    "content_hash",
+]
+
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
 MOE_RUNNER_BACKEND_CHOICES = [
@@ -362,6 +371,35 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
+    # ----------------------------------------------------------------
+    # KV cache admission policy
+    # ----------------------------------------------------------------
+    # Which policy to use when deciding whether a newly computed KV page
+    # should be stored in the prefix (radix) cache.
+    # "always"            – blindly cache everything (historical default).
+    # "never"             – cache nothing (benchmark baseline).
+    # "prefix_popularity" – admit new pages only when the insertion-point
+    #                       prefix node has been accessed >= min_hit_count
+    #                       times (PrefixPopularityAdmissionPolicy).
+    # "ngram_frequency"   – admit pages whose bigram content surpasses a
+    #                       frequency threshold (NgramFrequencyAdmissionPolicy).
+    # "content_hash"      – admit a page once its exact content has been seen
+    #                       a minimum number of times (ContentHashAdmissionPolicy).
+    kv_cache_admission_policy: str = "always"
+    # Shared: unconditionally cache the first N tokens (covers system prompts).
+    kv_cache_admission_always_prefix_len: int = 0
+    # For prefix_popularity: minimum hit count of the last matched node.
+    kv_cache_admission_min_hit_count: int = 1
+    # For prefix_popularity: unconditionally admit this many pages from root.
+    kv_cache_admission_always_admit_pages: int = 0
+    # For ngram_frequency: minimum average bigram frequency to admit a page.
+    kv_cache_admission_min_frequency: float = 2.0
+    # For ngram_frequency: sliding-window size (number of bigrams remembered).
+    kv_cache_admission_ngram_window_size: int = 200_000
+    # For content_hash: minimum observed count before a page is admitted.
+    kv_cache_admission_min_count: int = 1
+    # For content_hash: sliding-window size (number of page-hashes remembered).
+    kv_cache_admission_hash_window_size: int = 50_000
     enable_prefill_delayer: bool = False
     prefill_delayer_max_delay_passes: int = 30
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
@@ -4265,6 +4303,94 @@ class ServerArgs:
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
             help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, and 'slru' stands for Segmented Least Recently Used.",
+        )
+        # ----------------------------------------------------------------
+        # KV cache admission policy arguments
+        # ----------------------------------------------------------------
+        parser.add_argument(
+            "--kv-cache-admission-policy",
+            type=str,
+            choices=KV_CACHE_ADMISSION_POLICY_CHOICES,
+            default=ServerArgs.kv_cache_admission_policy,
+            help=(
+                "KV cache admission policy. Controls which newly computed KV pages "
+                "are stored in the radix-tree prefix cache for future reuse. "
+                "'always' (default) caches everything. "
+                "'never' caches nothing (baseline). "
+                "'prefix_popularity' admits pages only when the prefix they extend "
+                "has been accessed enough times (--kv-cache-admission-min-hit-count). "
+                "'ngram_frequency' admits pages whose bigram content is sufficiently "
+                "common across recent requests (--kv-cache-admission-min-frequency). "
+                "'content_hash' admits a page once its exact token content has been "
+                "observed the required number of times (--kv-cache-admission-min-count)."
+            ),
+        )
+        parser.add_argument(
+            "--kv-cache-admission-always-prefix-len",
+            type=int,
+            default=ServerArgs.kv_cache_admission_always_prefix_len,
+            help=(
+                "Unconditionally admit the first N tokens into the KV cache "
+                "regardless of the admission policy. Useful for ensuring system "
+                "prompts are always cached. Default 0 (disabled). "
+                "Applies to 'ngram_frequency' and 'content_hash' policies."
+            ),
+        )
+        parser.add_argument(
+            "--kv-cache-admission-min-hit-count",
+            type=int,
+            default=ServerArgs.kv_cache_admission_min_hit_count,
+            help=(
+                "For --kv-cache-admission-policy=prefix_popularity: "
+                "minimum hit-count of the last matched radix-tree node before "
+                "new pages beyond it are admitted. Default 1."
+            ),
+        )
+        parser.add_argument(
+            "--kv-cache-admission-always-admit-pages",
+            type=int,
+            default=ServerArgs.kv_cache_admission_always_admit_pages,
+            help=(
+                "For --kv-cache-admission-policy=prefix_popularity: "
+                "unconditionally admit the first N pages from the root. Default 0."
+            ),
+        )
+        parser.add_argument(
+            "--kv-cache-admission-min-frequency",
+            type=float,
+            default=ServerArgs.kv_cache_admission_min_frequency,
+            help=(
+                "For --kv-cache-admission-policy=ngram_frequency: "
+                "minimum average bigram frequency for a page to be admitted. Default 2.0."
+            ),
+        )
+        parser.add_argument(
+            "--kv-cache-admission-ngram-window-size",
+            type=int,
+            default=ServerArgs.kv_cache_admission_ngram_window_size,
+            help=(
+                "For --kv-cache-admission-policy=ngram_frequency: "
+                "number of recent bigrams to keep in the sliding window. Default 200000."
+            ),
+        )
+        parser.add_argument(
+            "--kv-cache-admission-min-count",
+            type=int,
+            default=ServerArgs.kv_cache_admission_min_count,
+            help=(
+                "For --kv-cache-admission-policy=content_hash: "
+                "minimum observed occurrences of a page's content before it is "
+                "admitted. Default 1 (admit on second occurrence)."
+            ),
+        )
+        parser.add_argument(
+            "--kv-cache-admission-hash-window-size",
+            type=int,
+            default=ServerArgs.kv_cache_admission_hash_window_size,
+            help=(
+                "For --kv-cache-admission-policy=content_hash: "
+                "number of recent page-hashes to remember. Default 50000."
+            ),
         )
         parser.add_argument(
             "--enable-prefill-delayer",

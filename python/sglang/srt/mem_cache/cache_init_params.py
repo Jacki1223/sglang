@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.admission_policy import KVAdmissionPolicy
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
@@ -36,3 +37,6 @@ class CacheInitParams:
 
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
     cache_ttl_seconds: Optional[float] = None
+
+    # KV cache admission policy.  None means "always admit" (historical default).
+    admission_policy: Optional["KVAdmissionPolicy"] = None

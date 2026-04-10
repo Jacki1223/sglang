@@ -40,6 +40,7 @@ from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
 )
+from sglang.srt.mem_cache.admission_policy import AlwaysAdmitPolicy, KVAdmissionPolicy
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -293,6 +294,13 @@ class RadixCache(BasePrefixCache):
         self.disable_finished_insert = params.disable_finished_insert
         self.eviction_policy = params.eviction_policy.lower()
 
+        # KV cache admission policy (None → always admit, i.e. legacy behaviour).
+        self.admission_policy: KVAdmissionPolicy = (
+            params.admission_policy
+            if params.admission_policy is not None
+            else AlwaysAdmitPolicy()
+        )
+
         self.kv_event_queue = []
 
         if params.enable_metrics:
@@ -461,7 +469,14 @@ class RadixCache(BasePrefixCache):
         return InsertResult(prefix_len=prefix_len)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
-        """Cache request when it finishes."""
+        """Cache request when it finishes.
+
+        When an admission policy is configured, only tokens up to the
+        page-aligned length returned by ``admission_policy.compute_admit_length``
+        are inserted into the radix tree; the remainder is freed immediately.
+        This replaces the previous "blind write-in" behaviour where every
+        computed KV page was unconditionally cached.
+        """
         # In deterministic mode, disable finished request insertion to radix cache
         if self.disable_finished_insert:
             is_insert = False
@@ -483,18 +498,59 @@ class RadixCache(BasePrefixCache):
         keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
         keys = page_align_keys(keys, self.page_size)
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
-        radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
 
         # Radix Cache takes one ref in memory pool
         if is_insert:
             priority = getattr(req, "priority", 0) or 0
-            result = self.insert(
-                InsertParams(key=radix_key, value=values, priority=priority)
+
+            # ----------------------------------------------------------------
+            # Selective admission: ask the policy how much of the new tail to
+            # cache.  For the default AlwaysAdmitPolicy this is len(keys),
+            # reproducing the historical "cache everything" behaviour.
+            # ----------------------------------------------------------------
+            admit_len = self.admission_policy.compute_admit_length(
+                token_ids=keys,
+                cached_len=req.cache_protected_len,
+                page_size=self.page_size,
+                node=req.last_node,
             )
-            new_prefix_len = result.prefix_len
-            # Free the duplicates that were already in the tree
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : new_prefix_len]
+            # Clamp to [cached_len, floor_page(len(keys))]
+            admit_len = max(
+                req.cache_protected_len,
+                min(admit_len, KVAdmissionPolicy.floor_page(len(keys), self.page_size)),
+            )
+
+            if admit_len > req.cache_protected_len:
+                # Insert only the admitted prefix.
+                admitted_key = RadixKey(
+                    keys[:admit_len], req.extra_key, is_bigram=self.is_eagle
+                )
+                admitted_values = values[:admit_len]
+                result = self.insert(
+                    InsertParams(
+                        key=admitted_key, value=admitted_values, priority=priority
+                    )
+                )
+                new_prefix_len = result.prefix_len
+                # Free duplicates (already in tree before this insert).
+                self.token_to_kv_pool_allocator.free(
+                    kv_indices[req.cache_protected_len : new_prefix_len]
+                )
+                # Free the non-admitted tail.
+                if admit_len < len(keys):
+                    self.token_to_kv_pool_allocator.free(kv_indices[admit_len : len(keys)])
+            else:
+                # Nothing new to admit – free everything beyond the protected prefix.
+                self.token_to_kv_pool_allocator.free(
+                    kv_indices[req.cache_protected_len : len(keys)]
+                )
+
+            # Update admission-policy statistics for future decisions.
+            self.admission_policy.update(
+                token_ids=keys,
+                admitted_len=admit_len,
+                cached_len=req.cache_protected_len,
+                page_size=self.page_size,
             )
         else:
             self.token_to_kv_pool_allocator.free(
