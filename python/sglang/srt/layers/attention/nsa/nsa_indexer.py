@@ -419,6 +419,57 @@ class Indexer(MultiPlatformOp):
             return
         dst.copy_(src)
 
+    def _maybe_run_hisa_paged(
+        self,
+        q_fp8: torch.Tensor,
+        kv_cache_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        seqlens_2d: torch.Tensor,
+        block_tables: torch.Tensor,
+        max_seq_len: int,
+    ) -> Optional[torch.Tensor]:
+        """Run HISA's hierarchical indexer when enabled and applicable.
+
+        Returns the dense-shaped ``[N_q, max_seq_len]`` logits tensor (with
+        non-selected blocks at -inf) so the existing ``topk_transform``
+        path is unchanged. Returns None when HISA is disabled or the
+        current batch falls outside HISA's supported configuration; the
+        caller then runs the dense kernel.
+        """
+        if not _is_cuda:
+            # AMD path uses a different kernel and page_size; not supported yet.
+            return None
+
+        from sglang.srt.layers.attention.nsa.hisa_indexer import (
+            get_hisa_config,
+            hisa_paged_logits_from_indexer_cache,
+            is_hisa_enabled,
+        )
+
+        if not is_hisa_enabled():
+            return None
+        if seqlens_2d.dim() != 2 or seqlens_2d.shape[1] != 1:
+            # next_n>1 (target_verify / draft_extend_v2) not yet supported.
+            return None
+        if q_fp8.shape[0] == 0:
+            return None
+
+        config = get_hisa_config()
+        # Skip HISA on short context: stage-1 has fixed cost that does not
+        # pay off below this threshold.
+        if max_seq_len <= config.min_seq_len:
+            return None
+
+        return hisa_paged_logits_from_indexer_cache(
+            q_fp8=q_fp8,
+            kv_cache_fp8=kv_cache_fp8,
+            weights=weights,
+            seqlens_2d=seqlens_2d,
+            block_tables=block_tables,
+            max_seq_len=max_seq_len,
+            config=config,
+        )
+
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,
@@ -512,16 +563,25 @@ class Indexer(MultiPlatformOp):
                 KVBlockSize=block_kv,
             )
         else:
-            logits = deep_gemm.fp8_paged_mqa_logits(
-                q_fp8[:q_offset],
-                kv_cache_fp8,
-                weights[:q_offset],
-                seqlens_32_2d,
-                block_tables,
-                schedule_metadata,
-                max_seq_len,
-                clean_logits=False,
+            logits = self._maybe_run_hisa_paged(
+                q_fp8=q_fp8[:q_offset],
+                kv_cache_fp8=kv_cache_fp8,
+                weights=weights[:q_offset],
+                seqlens_2d=seqlens_32_2d,
+                block_tables=block_tables,
+                max_seq_len=max_seq_len,
             )
+            if logits is None:
+                logits = deep_gemm.fp8_paged_mqa_logits(
+                    q_fp8[:q_offset],
+                    kv_cache_fp8,
+                    weights[:q_offset],
+                    seqlens_32_2d,
+                    block_tables,
+                    schedule_metadata,
+                    max_seq_len,
+                    clean_logits=False,
+                )
 
         # NOTE(dark): logits should be cleaned in topk_transform
         topk_result = metadata.topk_transform(logits, self.index_topk)
