@@ -1,20 +1,28 @@
 """Wiring layer that adapts SGLang's NSA indexer storage to the HISA kernel.
 
+HISA (arXiv:2603.28458, "Hierarchical Indexing for Fine-Grained Sparse
+Attention") replaces the DSA lightning indexer's O(L^2) per-query scan
+with a two-stage block-then-token scoring pipeline. It is **distinct
+from** SGLang's `--enable-hisparse` (HiSparse: hierarchical *memory*
+scheme from the LMSYS 2026-04 blog) which rearranges KV cache tiers but
+keeps the dense indexer; the two flags are orthogonal.
+
 The NSA indexer stores keys in a packed FP8 cache (per-token interleaved
 [128 byte FP8 || 4 byte FP32 scale]). The HISA Triton kernels in
-`hisa_kernel.py` consume BF16 keys for clarity and ease of testing. This
-module:
+``hisa_kernel.py`` consume BF16 keys for clarity and ease of testing.
+This module:
 
 1. Gathers the set of unique pages referenced by the current batch's
    block table (avoiding a full-cache dequant).
 2. Dequantizes those pages to BF16 once.
 3. Calls the HISA two-stage kernel and returns logits with the same
-   `[N_q, max_seq_len]` shape and semantics as
-   `deep_gemm.fp8_paged_mqa_logits(..., clean_logits=False)`.
+   ``[N_q, max_seq_len]`` shape and semantics as
+   ``deep_gemm.fp8_paged_mqa_logits(..., clean_logits=False)``.
 
-Activation is gated by `--enable-hisparse` and `--hisparse-config`. If
-HISA cannot run (max_kv_len < min_seq_len, unsupported next_n>1, missing
-Triton, etc.) the caller falls back to the dense kernel.
+Activation is gated by ``--enable-hisa-indexer`` and
+``--hisa-indexer-config``. If HISA cannot run (max_kv_len < min_seq_len,
+unsupported next_n>1, CUDA-graph capture, AMD path, etc.) the caller
+falls back to the dense kernel.
 """
 
 from __future__ import annotations
@@ -38,7 +46,7 @@ _HISA_BANNER_LOGGED = False
 
 
 def get_hisa_config() -> HISAConfig:
-    """Cached parser for ``--hisparse-config``.
+    """Cached parser for ``--hisa-indexer-config``.
 
     The parsed config is process-global; server args are immutable after
     startup so this is safe.
@@ -47,15 +55,20 @@ def get_hisa_config() -> HISAConfig:
     if _HISA_CONFIG_CACHE is None:
         srv = get_global_server_args()
         _HISA_CONFIG_CACHE = HISAConfig.from_json(
-            getattr(srv, "hisparse_config", None)
+            getattr(srv, "hisa_indexer_config", None)
         )
     return _HISA_CONFIG_CACHE
 
 
 def is_hisa_enabled() -> bool:
-    """True if `--enable-hisparse` was passed on launch."""
+    """True if ``--enable-hisa-indexer`` was passed on launch.
+
+    Note: this is **distinct from** ``--enable-hisparse``. HiSparse is a
+    hierarchical KV memory scheme; HISA is a hierarchical indexer
+    algorithm. The two flags are orthogonal and may eventually coexist.
+    """
     srv = get_global_server_args()
-    enabled = bool(getattr(srv, "enable_hisparse", False))
+    enabled = bool(getattr(srv, "enable_hisa_indexer", False))
     global _HISA_BANNER_LOGGED
     if enabled and not _HISA_BANNER_LOGGED:
         cfg = get_hisa_config()

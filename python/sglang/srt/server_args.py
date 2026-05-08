@@ -604,6 +604,14 @@ class ServerArgs:
     enable_hisparse: bool = False
     hisparse_config: Optional[str] = None
 
+    # HISA: hierarchical indexing for the DSA lightning indexer
+    # (arXiv:2603.28458). Orthogonal to --enable-hisparse: HiSparse rearranges
+    # KV memory tiers, while HISA replaces the O(L^2) per-query indexer scan
+    # with a two-stage block-then-token scoring pipeline that produces the
+    # same top-k pattern fed to Sparse MLA.
+    enable_hisa_indexer: bool = False
+    hisa_indexer_config: Optional[str] = None
+
     # LMCache
     enable_lmcache: bool = False
 
@@ -5862,6 +5870,27 @@ class ServerArgs:
             'Example: \'{"top_k": 2048, "device_buffer_size": 4096}\'',
         )
 
+        # HISA hierarchical indexing (arXiv:2603.28458). Orthogonal to HiSparse.
+        parser.add_argument(
+            "--enable-hisa-indexer",
+            action="store_true",
+            help="Replace the DSA lightning indexer's O(L^2) full-prefix scan "
+            "with the HISA two-stage block-then-token indexer "
+            "(arXiv:2603.28458). Currently active for paged decode/idle "
+            "(next_n=1) on CUDA, BF16 dequant path. This flag is orthogonal "
+            "to --enable-hisparse and may be combined with it once both "
+            "land their production kernels.",
+        )
+
+        parser.add_argument(
+            "--hisa-indexer-config",
+            type=str,
+            default=ServerArgs.hisa_indexer_config,
+            help="A dictionary in JSON string format for HISA indexer "
+            "configuration. "
+            'Example: \'{"top_blocks": 64, "block_size": 64, "min_seq_len": 4096}\'',
+        )
+
         # LMCache
         parser.add_argument(
             "--enable-lmcache",
@@ -6907,6 +6936,24 @@ class ServerArgs:
                         f"--nsa-{label}-backend in {sorted(allowed_backends_for_dtype)}, "
                         f"but got {backend}."
                     )
+
+        # Check HISA indexer (arXiv:2603.28458). Orthogonal to HiSparse: this
+        # only constrains the indexer algorithm, not the KV cache dtype or NSA
+        # backend selection.
+        if self.enable_hisa_indexer:
+            from sglang.srt.configs.model_config import is_deepseek_nsa
+
+            hf_config = self.get_model_config().hf_config
+            assert is_deepseek_nsa(hf_config), (
+                "--enable-hisa-indexer is only supported for DSA "
+                "(DeepSeek Sparse Attention) models (e.g., DeepSeek V3.2, "
+                "GLM-5). HISA replaces the DSA lightning indexer; it has no "
+                "effect on non-DSA models."
+            )
+            # HISA does not currently require --disable-radix-cache: the MVP
+            # pools K on the fly per indexer call and keeps no persistent
+            # cross-request state. Once a persistent pooled-K cache is added
+            # the radix-cache invalidation hooks will need to be wired.
 
         assert (
             self.schedule_conservativeness >= 0
