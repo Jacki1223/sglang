@@ -19,6 +19,7 @@ Triton, etc.) the caller falls back to the dense kernel.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import torch
@@ -29,8 +30,11 @@ from sglang.srt.layers.attention.nsa.hisa_kernel import (
 )
 from sglang.srt.server_args import get_global_server_args
 
+logger = logging.getLogger(__name__)
+
 
 _HISA_CONFIG_CACHE: Optional[HISAConfig] = None
+_HISA_BANNER_LOGGED = False
 
 
 def get_hisa_config() -> HISAConfig:
@@ -51,7 +55,22 @@ def get_hisa_config() -> HISAConfig:
 def is_hisa_enabled() -> bool:
     """True if `--enable-hisparse` was passed on launch."""
     srv = get_global_server_args()
-    return bool(getattr(srv, "enable_hisparse", False))
+    enabled = bool(getattr(srv, "enable_hisparse", False))
+    global _HISA_BANNER_LOGGED
+    if enabled and not _HISA_BANNER_LOGGED:
+        cfg = get_hisa_config()
+        logger.warning(
+            "HISA hierarchical indexer enabled (top_blocks=%d, block_size=%d, "
+            "min_seq_len=%d). Currently active for paged decode/idle "
+            "(next_n=1) on CUDA, BF16 dequant path. HISA is bypassed during "
+            "CUDA-graph capture; pass --disable-cuda-graph to use HISA on "
+            "every decode step. Native FP8 + pooled-K cache is a follow-up.",
+            cfg.top_blocks,
+            cfg.block_size,
+            cfg.min_seq_len,
+        )
+        _HISA_BANNER_LOGGED = True
+    return enabled
 
 
 def _dequant_active_pages(

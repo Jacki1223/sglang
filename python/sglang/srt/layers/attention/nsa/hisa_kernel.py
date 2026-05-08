@@ -240,7 +240,10 @@ if _HAS_TRITON:
         # Compute block scores by accumulating over heads.
         offs_d = tl.arange(0, D)
         score = tl.zeros([BLOCK_BL], dtype=tl.float32)
-        for h in tl.static_range(H):
+        # Non-unrolled head loop: DSA indexer can have H=64, which would
+        # blow up code size with ``tl.static_range``. ``range`` over a
+        # constexpr lets the compiler decide.
+        for h in range(H):
             # q [D] for this head
             q_vec = tl.load(Q_ptr + pid_q * H * D + h * D + offs_d).to(tl.float32)
             # pooled K [BLOCK_BL, D]: load using gathered page indices
@@ -293,7 +296,10 @@ if _HAS_TRITON:
 
         offs_d = tl.arange(0, D)
         score = tl.zeros([P], dtype=tl.float32)
-        for h in tl.static_range(H):
+        # Non-unrolled head loop: DSA indexer can have H=64, which would
+        # blow up code size with ``tl.static_range``. ``range`` over a
+        # constexpr lets the compiler decide.
+        for h in range(H):
             q_vec = tl.load(Q_ptr + pid_q * H * D + h * D + offs_d).to(tl.float32)
             k_ptrs = (
                 K_ptr

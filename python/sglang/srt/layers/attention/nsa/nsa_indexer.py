@@ -440,6 +440,15 @@ class Indexer(MultiPlatformOp):
             # AMD path uses a different kernel and page_size; not supported yet.
             return None
 
+        # The current MVP wiring uses ``torch.unique`` to gather active pages,
+        # which produces a dynamic-shape output and is incompatible with CUDA
+        # Graph capture. A persistent pooled-K cache + native FP8 Triton
+        # kernel will lift this in a follow-up; for now we transparently fall
+        # back to the dense kernel during capture so that ``--enable-hisparse``
+        # never breaks an existing decode pipeline.
+        if get_is_capture_mode():
+            return None
+
         from sglang.srt.layers.attention.nsa.hisa_indexer import (
             get_hisa_config,
             hisa_paged_logits_from_indexer_cache,
