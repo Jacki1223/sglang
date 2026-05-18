@@ -422,6 +422,18 @@ class Envs:
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
     SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
 
+    # HISA (Hierarchical Indexed Sparse Attention; arXiv 2603.28458)
+    # Replaces DSA's flat indexer scan with a two-stage scan: block-level
+    # coarse filtering over per-page mean-pooled K, then token-level
+    # refinement within the retained candidate pages. CUDA-only.
+    SGLANG_NSA_HISA_ENABLE = EnvBool(False)
+    # Number of candidate tokens kept after Stage-1 (m * B). Must be a
+    # multiple of 64 (the page/block size). Default 8192 per the paper.
+    SGLANG_NSA_HISA_CANDIDATE_SIZE = EnvInt(8192)
+    # If set, additionally run the dense indexer and assert IoU with HISA
+    # output exceeds the configured threshold. For debugging only.
+    SGLANG_NSA_HISA_VERIFY = EnvBool(False)
+
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 

@@ -1935,12 +1935,45 @@ class NSATokenToKVPool(MLATokenToKVPool):
                 )
                 for _ in range(layer_num)
             ]
+            # HISA: one synthetic representative "token" per page (page_size=1
+            # slot of fp8 data + 1 fp32 scale). Allocated only when HISA is
+            # enabled to avoid memory cost in the dense path.
+            from sglang.srt.environ import envs as _envs
+
+            self.hisa_enabled = _envs.SGLANG_NSA_HISA_ENABLE.get()
+            if self.hisa_enabled:
+                num_pages = (index_buf_size + page_size + 1) // self.page_size
+                self.index_k_block_buffer = [
+                    torch.zeros(
+                        (num_pages, index_head_dim + 4),
+                        dtype=self.index_k_with_scale_buffer_dtype,
+                        device=device,
+                    )
+                    for _ in range(layer_num)
+                ]
+            else:
+                self.index_k_block_buffer = None
         self._finalize_allocation_log(size)
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.index_k_with_scale_buffer[layer_id - self.start_layer]
+
+    def get_index_k_block_buffer(self, layer_id: int) -> torch.Tensor:
+        """HISA: per-page mean-pooled K representative buffer.
+
+        Layout mirrors `index_k_with_scale_buffer` with page_size=1:
+        shape (num_pages, index_head_dim + 4) uint8, where the first
+        `index_head_dim` bytes are fp8 data and the trailing 4 bytes are the
+        float32 scale.
+        """
+        assert (
+            self.hisa_enabled and self.index_k_block_buffer is not None
+        ), "HISA block buffer not allocated; enable --enable-nsa-hisa."
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.index_k_block_buffer[layer_id - self.start_layer]
 
     def get_index_k_continuous(
         self,

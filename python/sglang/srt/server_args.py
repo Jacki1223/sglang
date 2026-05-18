@@ -511,6 +511,11 @@ class ServerArgs:
     nsa_decode_backend: Optional[str] = (
         None  # auto-detect based on hardware/kv_cache_dtype
     )
+    # HISA (Hierarchical Indexed Sparse Attention; arXiv 2603.28458).
+    # Replaces the DSA indexer's flat token scan with a two-stage hierarchical
+    # scan. Currently CUDA-only; falls back to dense indexer on other paths.
+    enable_nsa_hisa: bool = False
+    nsa_hisa_candidate_size: int = 8192
     disable_flashinfer_autotune: bool = False
     mamba_backend: str = "triton"
 
@@ -1713,6 +1718,27 @@ class ServerArgs:
                 if self.is_attention_backend_not_set():
                     self.attention_backend = "nsa"
                     logger.info("Use nsa attention backend for DeepSeek with DSA.")
+
+                if self.enable_nsa_hisa:
+                    if not is_cuda():
+                        logger.warning(
+                            "--enable-nsa-hisa requires CUDA; ignoring on this platform."
+                        )
+                        self.enable_nsa_hisa = False
+                    elif self.nsa_hisa_candidate_size % 64 != 0:
+                        raise ValueError(
+                            "--nsa-hisa-candidate-size must be a multiple of 64 "
+                            f"(got {self.nsa_hisa_candidate_size})."
+                        )
+                    else:
+                        envs.SGLANG_NSA_HISA_ENABLE.set(True)
+                        envs.SGLANG_NSA_HISA_CANDIDATE_SIZE.set(
+                            self.nsa_hisa_candidate_size
+                        )
+                        logger.info(
+                            f"HISA enabled: candidate_size={self.nsa_hisa_candidate_size}, "
+                            f"block_size=64 (page-aligned)."
+                        )
 
                 if not is_npu() and not is_xpu():  # CUDA or ROCm GPU
                     if self.enable_nsa_prefill_context_parallel:
@@ -5307,6 +5333,23 @@ class ServerArgs:
             type=str,
             choices=NSA_CHOICES,
             help="NSA decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+        )
+        parser.add_argument(
+            "--enable-nsa-hisa",
+            action="store_true",
+            default=ServerArgs.enable_nsa_hisa,
+            help="Enable HISA (Hierarchical Indexed Sparse Attention) as a "
+            "drop-in replacement for the DSA indexer's flat scan. "
+            "Two-stage: block-level coarse filter on per-page mean-pooled K, "
+            "then token-level refinement within retained candidate pages. "
+            "CUDA-only; other code paths fall back to the dense indexer.",
+        )
+        parser.add_argument(
+            "--nsa-hisa-candidate-size",
+            type=int,
+            default=ServerArgs.nsa_hisa_candidate_size,
+            help="HISA Stage-1 candidate token-pool size m*B. Must be a "
+            "multiple of 64 and >= --nsa-index-topk. Default 8192.",
         )
         parser.add_argument(
             "--fp8-gemm-backend",

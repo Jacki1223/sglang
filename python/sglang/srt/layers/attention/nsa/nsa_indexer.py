@@ -244,6 +244,24 @@ class Indexer(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
+        # HISA (arXiv 2603.28458) configuration. CUDA-only; other paths fall
+        # back to the dense indexer at dispatch time. Read once at init so
+        # cuda-graph capture sees a stable boolean.
+        self.hisa_enabled = bool(
+            _is_cuda and envs.SGLANG_NSA_HISA_ENABLE.get()
+        )
+        self.hisa_candidate_size = int(envs.SGLANG_NSA_HISA_CANDIDATE_SIZE.get())
+        if self.hisa_enabled:
+            assert (
+                self.hisa_candidate_size % 64 == 0
+            ), "HISA candidate size must be a multiple of 64."
+            assert (
+                self.hisa_candidate_size >= self.index_topk
+            ), (
+                f"HISA candidate size {self.hisa_candidate_size} must be >= "
+                f"index_topk {self.index_topk}."
+            )
+
     @contextlib.contextmanager
     def _with_real_sm_count(self):
         # When pipeline parallelism is enabled, each PP rank initiates a recv operation after the _pp_launch_batch
@@ -512,16 +530,43 @@ class Indexer(MultiPlatformOp):
                 KVBlockSize=block_kv,
             )
         else:
-            logits = deep_gemm.fp8_paged_mqa_logits(
-                q_fp8[:q_offset],
-                kv_cache_fp8,
-                weights[:q_offset],
-                seqlens_32_2d,
-                block_tables,
-                schedule_metadata,
-                max_seq_len,
-                clean_logits=False,
+            # HISA fast path (CUDA, paged, decode/MTP). Falls back to the
+            # dense kernel below when the batch shape doesn't match our
+            # current support (Q != B, no block-pool, etc.).
+            use_hisa = (
+                self.hisa_enabled
+                and getattr(
+                    forward_batch.token_to_kv_pool, "hisa_enabled", False
+                )
+                and q_offset == seqlens_32_2d.shape[0]
             )
+            if use_hisa:
+                from sglang.srt.layers.attention.nsa.hisa import (
+                    hisa_paged_logits,
+                )
+
+                logits = hisa_paged_logits(
+                    q_fp8=q_fp8[:q_offset],
+                    weights=weights[:q_offset],
+                    pool=forward_batch.token_to_kv_pool,
+                    layer_id=layer_id,
+                    seqlens_32_2d=seqlens_32_2d,
+                    block_tables=block_tables,
+                    max_seq_len=max_seq_len,
+                    candidate_size=self.hisa_candidate_size,
+                    sm_count=self.sm_count,
+                )
+            else:
+                logits = deep_gemm.fp8_paged_mqa_logits(
+                    q_fp8[:q_offset],
+                    kv_cache_fp8,
+                    weights[:q_offset],
+                    seqlens_32_2d,
+                    block_tables,
+                    schedule_metadata,
+                    max_seq_len,
+                    clean_logits=False,
+                )
 
         # NOTE(dark): logits should be cleaned in topk_transform
         topk_result = metadata.topk_transform(logits, self.index_topk)
@@ -1005,6 +1050,36 @@ class Indexer(MultiPlatformOp):
         topk_indices = torch.cat(topk_indices_list, dim=0)
         return topk_indices
 
+    def _maybe_update_hisa_block_pool(
+        self, forward_batch: ForwardBatch, layer_id: int
+    ) -> None:
+        """If HISA is enabled, refresh the per-page mean-pooled K
+        representative for every page touched this step.
+
+        Called after the regular indexer K cache write completes. Cheap:
+        only the pages that received new tokens are recomputed.
+        """
+        if not self.hisa_enabled:
+            return
+        if not _is_cuda:
+            return
+        try:
+            from sglang.srt.layers.attention.nsa.hisa import (
+                update_block_pool_for_locs,
+            )
+
+            update_block_pool_for_locs(
+                forward_batch.token_to_kv_pool,
+                layer_id,
+                forward_batch.out_cache_loc,
+            )
+        except Exception:
+            # Defensive: HISA pool update must never break dense path. If
+            # something goes wrong we silently skip the update; the next
+            # call into the HISA topk path will detect the stale pool via
+            # the env flag and fall back.
+            self.hisa_enabled = False
+
     def _store_index_k_cache(
         self,
         forward_batch: ForwardBatch,
@@ -1040,6 +1115,7 @@ class Indexer(MultiPlatformOp):
                 forward_batch.out_cache_loc,
                 forward_batch.token_to_kv_pool.page_size,
             )
+            self._maybe_update_hisa_block_pool(forward_batch, layer_id)
             return
 
         # Fast path: AITER fused quant + cache store (HIP, page_size=1)
@@ -1056,6 +1132,7 @@ class Indexer(MultiPlatformOp):
             indexer_k_quant_and_cache(
                 key, kv_cache, out_loc, self.block_size, self.scale_fmt
             )
+            self._maybe_update_hisa_block_pool(forward_batch, layer_id)
             return
 
         # Fallback: original path
@@ -1072,6 +1149,7 @@ class Indexer(MultiPlatformOp):
             index_k=k_fp8,
             index_k_scale=k_scale,
         )
+        self._maybe_update_hisa_block_pool(forward_batch, layer_id)
 
     def forward_xpu(
         self,
